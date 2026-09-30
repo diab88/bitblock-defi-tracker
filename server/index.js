@@ -1,0 +1,875 @@
+import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDb, CHAINS, STRATEGIES } from './db.js';
+import { computeExposure, detectHedges, underlying } from './hedges.js';
+import { computePosition, summarizeByCurrency, portfolioSeries, positionSeries } from './calc.js';
+import { fetchCoingeckoHistory } from './integrations.js';
+import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExit, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, isEvmAddress, isSolanaAddress } from './integrations.js';
+
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const PORT = Number(process.env.PORT || 8080);
+const AUTO_SYNC_HOURS = Number(process.env.AUTO_SYNC_HOURS ?? 12);
+const db = openDb(process.env.DB_PATH || path.join(root, 'data', 'tracker.db'));
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+// Optional single-user protection for when the container is exposed beyond localhost.
+if (process.env.APP_PASSWORD) {
+  app.use((req, res, next) => {
+    const [, b64] = (req.headers.authorization || '').split(' ');
+    const [, pass] = Buffer.from(b64 || '', 'base64').toString().split(':');
+    if (pass === process.env.APP_PASSWORD) return next();
+    res.set('WWW-Authenticate', 'Basic realm="BitBlock DeFi Tracker"').status(401).send('Authentication required');
+  });
+}
+
+app.use(express.static(path.join(root, 'public')));
+app.use('/vendor/chart.js', express.static(path.join(root, 'node_modules/chart.js/dist')));
+
+// ---------- helpers ----------
+const today = () => new Date().toISOString().slice(0, 10);
+const isDate = (d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(d));
+const num = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
+const text = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+function priceMap() {
+  return Object.fromEntries(db.prepare('SELECT * FROM prices').all().map((p) => [p.symbol, p]));
+}
+
+function loadPositions() {
+  const prices = priceMap();
+  const wallets = Object.fromEntries(db.prepare('SELECT id, name FROM wallets').all().map((w) => [w.id, w.name]));
+  const events = db.prepare('SELECT * FROM events').all();
+  const byPos = {};
+  for (const e of events) (byPos[e.position_id] ??= []).push(e);
+  return db.prepare('SELECT * FROM positions ORDER BY closed, entry_date DESC, id DESC').all().map((p) => {
+    const evs = byPos[p.id] || [];
+    return { ...p, wallet: wallets[p.wallet_id] ?? null, events: evs, metrics: computePosition(p, evs, prices[p.currency]) };
+  });
+}
+
+function positionFields(b) {
+  const f = {
+    wallet_id: num(b.wallet_id),
+    strategy: text(b.strategy), protocol: text(b.protocol), chain: text(b.chain), currency: text(b.currency),
+    entry_date: text(b.entry_date), exit_date: text(b.exit_date),
+    deposit: num(b.deposit), expected_return: num(b.expected_return),
+    comments: text(b.comments), debank_key: text(b.debank_key),
+  };
+  for (const k of ['entry_date', 'exit_date']) if (f[k] && !isDate(f[k])) throw new HttpError(400, `${k} must be YYYY-MM-DD`);
+  if (f.deposit !== null && !(f.deposit >= 0)) throw new HttpError(400, 'deposit must be a non-negative number');
+  return f;
+}
+
+function addEvent(positionId, { type, date, amount, note, source = 'manual' }) {
+  if (!['valuation', 'withdrawal', 'reward', 'fee', 'deposit'].includes(type)) throw new HttpError(400, 'invalid event type');
+  if (!isDate(date)) throw new HttpError(400, 'date must be YYYY-MM-DD');
+  const a = Number(amount);
+  if (!Number.isFinite(a) || a < 0) throw new HttpError(400, 'amount must be a non-negative number');
+  return db.prepare('INSERT INTO events (position_id, type, date, amount, note, source) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(positionId, type, date, a, text(note), source).lastInsertRowid;
+}
+
+const getPosition = (id) => {
+  const p = db.prepare('SELECT * FROM positions WHERE id = ?').get(id);
+  if (!p) throw new HttpError(404, 'position not found');
+  return p;
+};
+
+// ---------- meta ----------
+app.get('/api/meta', (_req, res) => {
+  res.json({
+    chains: CHAINS,
+    strategies: STRATEGIES,
+    currencies: db.prepare('SELECT symbol FROM prices ORDER BY rowid').all().map((r) => r.symbol),
+    wallets: db.prepare('SELECT * FROM wallets ORDER BY name').all(),
+    protocols: db.prepare('SELECT DISTINCT protocol FROM positions WHERE protocol IS NOT NULL ORDER BY protocol').all().map((r) => r.protocol),
+    debank: debankMode(),
+    zerion: zerionMode(),
+    lighter: lighterMode(),
+    extended: extendedMode(),
+    autoSyncHours: AUTO_SYNC_HOURS,
+  });
+});
+
+// ---------- positions ----------
+// Positions plus, for synced ones, what the source reports inside them (e.g. an exchange account's
+// P/L breakdown), so a single account row can be read part by part.
+app.get('/api/positions', (_req, res) => res.json(loadPositions().map((p) => {
+  if (!p.debank_key || !p.wallet_id) return p;
+  const item = accountSince(latestSnapshotItem(p.wallet_id, p.debank_key), p.entry_date, historicalPrices(p.entry_date));
+  if (!item?.breakdown) return p;
+  // The source's P/L is against its own capital figure; if the user changed the deposit, show the offset.
+  const depositOffset = item.depositUsd != null && p.deposit != null ? item.depositUsd - p.deposit : 0;
+  return { ...p, sourceDetail: { breakdown: item.breakdown, reconcile: item.reconcile, depositOffset, positions: item.positions, excludedTrades: item.excludedTrades || [], since: p.entry_date } };
+})));
+
+app.post('/api/positions', (req, res) => {
+  const f = positionFields(req.body);
+  const id = db.prepare(`INSERT INTO positions (wallet_id, strategy, protocol, chain, currency, entry_date, exit_date, deposit, expected_return, comments, debank_key)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(f.wallet_id, f.strategy, f.protocol, f.chain, f.currency, f.entry_date, f.exit_date, f.deposit, f.expected_return, f.comments, f.debank_key).lastInsertRowid;
+  const cv = num(req.body.current_value);
+  const vd = text(req.body.valuation_date) || f.entry_date || today();
+  if (cv !== null) addEvent(id, { type: 'valuation', date: vd, amount: cv, source: f.debank_key ? keyProvider(f.debank_key) : 'manual' });
+  if (f.debank_key && f.wallet_id) backfillHistory(Number(id), f.wallet_id, f.debank_key, f.currency, vd, f.entry_date);
+  res.status(201).json({ id: Number(id) });
+});
+
+app.put('/api/positions/:id', (req, res) => {
+  const p = getPosition(req.params.id);
+  const f = positionFields({ ...p, ...req.body });
+  db.prepare(`UPDATE positions SET wallet_id=?, strategy=?, protocol=?, chain=?, currency=?, entry_date=?, exit_date=?, deposit=?, expected_return=?, comments=?, debank_key=? WHERE id=?`)
+    .run(f.wallet_id, f.strategy, f.protocol, f.chain, f.currency, f.entry_date, f.exit_date, f.deposit, f.expected_return, f.comments, f.debank_key, p.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/positions/:id', (req, res) => {
+  db.prepare('DELETE FROM positions WHERE id = ?').run(getPosition(req.params.id).id);
+  res.json({ ok: true });
+});
+
+app.get('/api/positions/:id/series', (req, res) => {
+  const p = getPosition(req.params.id);
+  res.json(positionSeries(p, db.prepare('SELECT * FROM events WHERE position_id = ?').all(p.id)));
+});
+
+app.post('/api/positions/:id/events', (req, res) => {
+  const p = getPosition(req.params.id);
+  res.status(201).json({ id: Number(addEvent(p.id, req.body)) });
+});
+
+app.delete('/api/events/:id', (req, res) => {
+  db.prepare("UPDATE suggestions SET status = 'pending', event_id = NULL WHERE event_id = ?").run(req.params.id);
+  db.prepare('DELETE FROM events WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Close = final valuation at the exit date (exit proceeds) + mark closed. Mirrors sheet column X + G.
+app.post('/api/positions/:id/close', (req, res) => {
+  const p = getPosition(req.params.id);
+  const { exit_date, exit_value } = req.body;
+  if (!isDate(exit_date)) throw new HttpError(400, 'exit_date must be YYYY-MM-DD');
+  if (p.entry_date && exit_date < p.entry_date) throw new HttpError(400, 'exit date is before entry date');
+  if (num(exit_value) !== null) addEvent(p.id, { type: 'valuation', date: exit_date, amount: exit_value, note: 'Exit proceeds' });
+  db.prepare('UPDATE positions SET closed = 1, exit_date = ? WHERE id = ?').run(exit_date, p.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/positions/:id/reopen', (req, res) => {
+  db.prepare('UPDATE positions SET closed = 0, exit_date = NULL WHERE id = ?').run(getPosition(req.params.id).id);
+  res.json({ ok: true });
+});
+
+// ---------- dashboard ----------
+app.get('/api/dashboard', (req, res) => {
+  const { wallet, currency, status } = req.query;
+  let rows = loadPositions();
+  if (wallet === 'none') rows = rows.filter((r) => !r.wallet_id);
+  else if (wallet) rows = rows.filter((r) => String(r.wallet_id) === wallet);
+  if (currency) rows = rows.filter((r) => r.currency === currency);
+  if (status === 'open') rows = rows.filter((r) => r.metrics.status === 'Open');
+  if (status === 'closed') rows = rows.filter((r) => r.metrics.status === 'Closed');
+
+  const counted = rows.filter((r) => ['Open', 'Closed'].includes(r.metrics.status));
+  const priced = counted.filter((r) => r.metrics.usdPrice);
+  const sum = (arr, f) => arr.reduce((s, r) => s + (f(r) || 0), 0);
+  const open = priced.filter((r) => r.metrics.status === 'Open');
+  const closedRows = priced.filter((r) => r.metrics.status === 'Closed');
+
+  const kpis = {
+    positions: rows.length,
+    open: counted.filter((r) => r.metrics.status === 'Open').length,
+    closed: counted.filter((r) => r.metrics.status === 'Closed').length,
+    incomplete: rows.length - counted.length,
+    unpriced: counted.length - priced.length,
+    investedOpenUsd: sum(open, (r) => r.metrics.depositUsd),
+    valueOpenUsd: sum(open, (r) => r.metrics.valueUsd),
+    pnlOpenUsd: sum(open, (r) => r.metrics.pnlUsd),
+    pnlClosedUsd: sum(closedRows, (r) => r.metrics.pnlUsd),
+    withdrawalsUsd: sum(priced, (r) => r.metrics.withdrawals * r.metrics.usdPrice),
+    rewardsUsd: sum(priced, (r) => r.metrics.rewards * r.metrics.usdPrice),
+    depositedUsd: sum(priced, (r) => r.metrics.depositUsd),
+  };
+  kpis.pnlUsd = kpis.pnlOpenUsd + kpis.pnlClosedUsd;
+  kpis.totalReturn = kpis.depositedUsd ? kpis.pnlUsd / kpis.depositedUsd : null;
+  // Deposit-weighted simple annualized return, matching the sheet's per-row definition.
+  const w = priced.filter((r) => r.metrics.annualized !== null);
+  kpis.weightedApr = sum(w, (r) => r.metrics.depositUsd) ? sum(w, (r) => r.metrics.annualized * r.metrics.depositUsd) / sum(w, (r) => r.metrics.depositUsd) : null;
+
+  const group = (key) => {
+    const g = {};
+    for (const r of priced) {
+      const k = r[key] || '—';
+      const o = (g[k] ??= { name: k, deposit: 0, value: 0, pnl: 0, count: 0 });
+      o.deposit += r.metrics.depositUsd; o.value += r.metrics.valueUsd || 0; o.pnl += r.metrics.pnlUsd; o.count++;
+    }
+    return Object.values(g).map((o) => ({ ...o, ret: o.deposit ? o.pnl / o.deposit : null })).sort((a, b) => b.deposit - a.deposit);
+  };
+
+  // Strategy × Chain and Strategy × Venue matrices. Venue = protocol without its sub-label
+  // ("Lighter · LLP" → "Lighter"), so exchanges like Extended show by name rather than by settlement chain.
+  const venueOf = (r) => { const v = (r.protocol || '—').split(' · ')[0]; return v.startsWith('Wallet') ? 'Wallet' : v; };
+  // Components: most positions are one component. An exchange account whose source reports a breakdown is
+  // split: each hedged perp leg becomes its own component (P/L only), the rest stays with the account.
+  // Hedge legs — both the long position and the short leg — go to one "Delta-neutral hedge" row, so the
+  // legs sit side by side and the row total is the hedge's net. Totals are unchanged by the split.
+  const { hedges } = hedgeReport(rows);
+  const hedgeOf = new Map();
+  for (const h of hedges) for (const l of [...h.longs, ...h.shorts]) hedgeOf.set(`${l.positionId}|${l.kind === 'perp' ? l.symbol : ''}`, h.asset);
+  const HEDGE_ROW = (asset) => `Delta-neutral hedge (${asset})`;
+  const components = [];
+  for (const r of priced) {
+    const base = { chain: r.chain, venue: venueOf(r), deposit: r.metrics.depositUsd, value: r.metrics.valueUsd || 0, pnl: r.metrics.pnlUsd, strategy: r.strategy };
+    const longHedge = hedgeOf.get(`${r.id}|`);
+    if (longHedge) { components.push({ ...base, strategy: HEDGE_ROW(longHedge) }); continue; }
+    const item = r.debank_key && r.wallet_id ? accountSince(latestSnapshotItem(r.wallet_id, r.debank_key), r.entry_date, historicalPrices(r.entry_date)) : null;
+    let rest = base.pnl;
+    for (const [market, parts] of Object.entries(Object.groupBy?.(item?.breakdown?.filter((b) => b.market) || [], (b) => b.market) || {})) {
+      const asset = hedgeOf.get(`${r.id}|${market.split('-')[0]}`);
+      if (!asset) continue;
+      const legPnl = parts.reduce((a, b) => a + b.usd, 0);
+      components.push({ ...base, strategy: HEDGE_ROW(asset), deposit: 0, value: 0, pnl: legPnl, leg: true });
+      rest -= legPnl;
+    }
+    components.push({ ...base, pnl: rest });
+  }
+  const buildMatrix = (colOf) => {
+    const m = {};
+    for (const c of components) {
+      const cell = ((m[c.strategy] ??= {})[colOf(c) || '—'] ??= { deposit: 0, pnl: 0, value: 0, count: 0, legs: 0 });
+      cell.deposit += c.deposit; cell.pnl += c.pnl; cell.value += c.value; cell.count++;
+      if (c.leg) cell.legs++;
+    }
+    return m;
+  };
+  const matrix = buildMatrix((c) => c.chain);
+  const matrixByVenue = buildMatrix((c) => c.venue);
+
+  res.json({
+    kpis,
+    untracked: currency && currency !== 'USD' ? [] : untrackedHoldings(wallet).map((u) => ({ ...u, items: u.items.map(({ base, ...i }) => i) })),
+    series: portfolioSeries(counted),
+    byStrategy: group('strategy'),
+    byChain: group('chain'),
+    byProtocol: group('protocol'),
+    byWallet: group('wallet'),
+    matrix,
+    matrixByVenue,
+    currencySummary: summarizeByCurrency(rows),
+    positions: rows.map(({ events, ...r }) => r),
+  });
+});
+
+// ---------- wallets ----------
+app.get('/api/wallets', (_req, res) => {
+  const wallets = db.prepare('SELECT * FROM wallets ORDER BY name').all();
+  const snap = db.prepare('SELECT provider, fetched_at, total_usd FROM debank_snapshots WHERE wallet_id = ? ORDER BY id DESC LIMIT 1');
+  const count = db.prepare('SELECT COUNT(*) n FROM positions WHERE wallet_id = ?');
+  res.json(wallets.map((w) => ({ ...w, positions: count.get(w.id).n, lastSync: snap.get(w.id) ?? null })));
+});
+
+app.post('/api/wallets', (req, res) => {
+  const name = text(req.body.name);
+  const address = text(req.body.address);
+  if (!name) throw new HttpError(400, 'wallet name is required');
+  let kind = 'manual';
+  if (address) {
+    if (isEvmAddress(address)) kind = 'evm';
+    else if (isSolanaAddress(address)) kind = 'solana';
+    else throw new HttpError(400, 'address is neither a valid EVM (0x…) nor Solana address');
+    const existing = db.prepare('SELECT * FROM wallets WHERE lower(address) = lower(?)').get(address);
+    if (existing) return res.json(existing);
+  }
+  const trackFrom = parseTrackFrom(req.body.track_from ?? 'today');
+  try {
+    const id = db.prepare('INSERT INTO wallets (name, address, kind, source, track_from) VALUES (?, ?, ?, ?, ?)').run(name, address, kind, text(req.body.source) || (address ? 'address' : 'manual'), trackFrom).lastInsertRowid;
+    res.status(201).json(db.prepare('SELECT * FROM wallets WHERE id = ?').get(id));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a wallet with that name already exists');
+    throw e;
+  }
+});
+
+// "today" → today's date, "all"/empty → NULL (all history), or an explicit YYYY-MM-DD not in the future.
+function parseTrackFrom(v) {
+  if (v === undefined || v === null || v === '' || v === 'all') return null;
+  if (v === 'today') return today();
+  if (!isDate(v)) throw new HttpError(400, 'track_from must be "today", "all" or YYYY-MM-DD');
+  if (v > today()) throw new HttpError(400, 'track_from cannot be in the future');
+  return v;
+}
+
+app.put('/api/wallets/:id', (req, res) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
+  if (!w) throw new HttpError(404, 'wallet not found');
+  const name = req.body.name === undefined ? w.name : text(req.body.name);
+  if (!name) throw new HttpError(400, 'wallet name is required');
+  const trackFrom = req.body.track_from === undefined ? w.track_from : parseTrackFrom(req.body.track_from);
+  db.prepare('UPDATE wallets SET name = ?, track_from = ? WHERE id = ?').run(name, trackFrom, w.id);
+  res.json({ ok: true, track_from: trackFrom });
+});
+
+app.delete('/api/wallets/:id', (req, res) => {
+  db.prepare('DELETE FROM wallets WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/wallets/:id/balance', wrap(async (req, res) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
+  if (!w) throw new HttpError(404, 'wallet not found');
+  if (w.kind !== 'solana') throw new HttpError(400, 'native balance lookup on the server is only for Solana wallets');
+  res.json({ symbol: 'SOL', balance: await fetchSolanaBalance(w.address) });
+}));
+
+function linkedPositions(walletId) {
+  return db.prepare('SELECT id, debank_key, currency, closed FROM positions WHERE wallet_id = ? AND debank_key IS NOT NULL').all(walletId);
+}
+
+const PROVIDERS = {
+  debank: { label: 'DeBank', mode: debankMode, kinds: ['evm'], fetch: (w) => fetchDebankPortfolio(w.address) },
+  zerion: { label: 'Zerion', mode: zerionMode, kinds: ['evm', 'solana'], fetch: (w) => fetchZerionPortfolio(w.address, w.kind) },
+  extended: {
+    label: 'Extended', mode: extendedMode, kinds: ['evm'], fetch: () => fetchExtendedPortfolio(),
+    // One key = one Extended account; pin it to a wallet with EXTENDED_WALLET_ADDRESS when you have several.
+    allows: (w) => !process.env.EXTENDED_WALLET_ADDRESS || w.address?.toLowerCase() === process.env.EXTENDED_WALLET_ADDRESS.toLowerCase(),
+  },
+  // After Extended on purpose: a hedged token's long leg is priced at the perp's mark (set during Extended's sync).
+  lighter: { label: 'Lighter', mode: lighterMode, kinds: ['evm'], fetch: (w) => fetchLighterPortfolio(w.address) },
+};
+const keyProvider = (key) => {
+  const prefix = key?.split('|')[0];
+  return PROVIDERS[prefix] && prefix !== 'debank' ? prefix : 'debank'; // DeBank keys predate the prefix
+};
+
+function latestSnapshotItem(walletId, key) {
+  const s = db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1').get(walletId, keyProvider(key));
+  const v = snapshotView(s, walletId);
+  return v?.items.find((i) => i.key === key) ?? null;
+}
+
+// Sources that publish history (Lighter share prices) get past valuations filled in on tracking,
+// so charts start at the real entry date instead of today.
+function backfillHistory(positionId, walletId, key, currency, beforeDate, entryDate) {
+  const item = latestSnapshotItem(walletId, key);
+  if (!item?.history?.length) return 0;
+  const px = currency === 'USD' ? 1 : priceMap()[currency]?.usd_price;
+  if (!px) return 0;
+  const provider = keyProvider(key);
+  let n = 0;
+  for (const h of item.history) {
+    if (h.date >= beforeDate || (entryDate && h.date < entryDate)) continue;
+    addEvent(positionId, { type: 'valuation', date: h.date, amount: h.value / px, note: `${PROVIDERS[provider].label} history`, source: provider });
+    n++;
+  }
+  return n;
+}
+
+const historicalPrices = (date) => Object.fromEntries(db.prepare('SELECT symbol, usd_price FROM price_history WHERE date = ?').all(date).map((r) => [r.symbol, r.usd_price]));
+
+// Make sure we have each needed token's price on `date` (cached forever; CoinGecko ids from the prices table).
+async function ensureHistoricalPrices(symbols, date) {
+  for (const sym of new Set(symbols)) {
+    if (db.prepare('SELECT 1 FROM price_history WHERE symbol = ? AND date = ?').get(sym, date)) continue;
+    const id = db.prepare('SELECT coingecko_id FROM prices WHERE symbol = ?').get(sym)?.coingecko_id;
+    if (!id) { console.warn(`no CoinGecko id for ${sym}; can't price it on ${date}`); continue; }
+    try {
+      const px = await fetchCoingeckoHistory(id, date);
+      if (px > 0) db.prepare('INSERT OR REPLACE INTO price_history (symbol, date, usd_price) VALUES (?, ?, ?)').run(sym, date, px);
+    } catch (e) { console.warn(e.message); }
+  }
+}
+
+// The internal copy of a source's original numbers (`base`) stays server-side.
+const forClient = (v) => (v ? { ...v, items: v.items.map(({ base, ...i }) => i) } : v);
+
+function snapshotView(s, walletId) {
+  if (!s) return null;
+  const links = Object.fromEntries(linkedPositions(walletId).map((p) => [p.debank_key, p.id]));
+  const meta = JSON.parse(s.items);
+  const since = db.prepare('SELECT track_from FROM wallets WHERE id = ?').get(walletId)?.track_from || null;
+  const priceAt = since ? historicalPrices(since) : {};
+  const items = (Array.isArray(meta) ? meta : meta.items).map((i) => applyTrackFrom(i, since, priceAt)); // older snapshots stored the bare array
+  return {
+    trackFrom: since,
+    provider: s.provider, fetchedAt: s.fetched_at, totalUsd: s.total_usd,
+    mock: !!meta.mock, balancesOnly: !!meta.balancesOnly,
+    items: items.map((i) => ({ ...i, positionId: links[i.key] ?? null })),
+  };
+}
+
+// Latest snapshot for the wallet (from whichever source synced last), or for one provider.
+app.get('/api/wallets/:id/snapshot', (req, res) => {
+  const p = req.query.provider;
+  const s = p
+    ? db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1').get(req.params.id, p)
+    : db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? ORDER BY id DESC LIMIT 1').get(req.params.id);
+  res.json(forClient(snapshotView(s, Number(req.params.id))));
+});
+
+// Pull the wallet's positions from a data source and record a valuation on every linked open position.
+async function syncWallet(walletId, provider) {
+  const src = PROVIDERS[provider];
+  if (!src) throw new HttpError(400, `unknown provider "${provider}"`);
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(walletId);
+  if (!w) throw new HttpError(404, 'wallet not found');
+  if (!src.kinds.includes(w.kind)) {
+    throw new HttpError(400, w.kind === 'solana'
+      ? `${src.label} covers EVM addresses only. Use Zerion for Solana.`
+      : 'This wallet has no address to sync.');
+  }
+  if (src.allows && !src.allows(w)) throw new HttpError(400, `${src.label} is pinned to another wallet (EXTENDED_WALLET_ADDRESS).`);
+  const pf = await src.fetch(w);
+  if (w.track_from && w.track_from < today()) {
+    const needs = pf.items.flatMap((i) => [
+      ...(i.positions || []).filter((p) => p.openedAt && p.openedAt < w.track_from).map((p) => String(p.market).split('-')[0]),
+      ...(i.currency && i.currency !== 'USD' && (!i.entryDate || i.entryDate < w.track_from) ? [i.currency] : []),
+    ]);
+    if (needs.length) await ensureHistoricalPrices(needs, w.track_from);
+  }
+
+  // Re-link tracked positions whose key the source changed, using earlier snapshots to know what they were.
+  const linkedHere = linkedPositions(w.id).filter((p) => keyProvider(p.debank_key) === provider);
+  if (linkedHere.some((p) => !pf.items.some((i) => i.key === p.debank_key))) {
+    const previous = db.prepare('SELECT items FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 50').all(w.id, provider)
+      .flatMap((r) => { const m = JSON.parse(r.items); return Array.isArray(m) ? m : m.items; });
+    for (const mv of relinkKeys(linkedHere.map((p) => ({ positionId: p.id, key: p.debank_key })), previous, pf.items)) {
+      db.prepare('UPDATE positions SET debank_key = ? WHERE id = ?').run(mv.to, mv.positionId);
+      console.log(`relinked position #${mv.positionId}: ${mv.from} → ${mv.to}`);
+    }
+  }
+
+  const prevRaw = db.prepare('SELECT items FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1').get(w.id, provider);
+  const prevItems = prevRaw ? (((m) => (Array.isArray(m) ? m : m.items))(JSON.parse(prevRaw.items))) : [];
+  const id = db.prepare('INSERT INTO debank_snapshots (wallet_id, provider, total_usd, items) VALUES (?, ?, ?, ?)')
+    .run(w.id, provider, pf.totalUsd, JSON.stringify({ items: pf.items, mock: !!pf.mock, balancesOnly: !!pf.balancesOnly })).lastInsertRowid;
+
+  // A perp's mark becomes the price of its token for the day, so a hedge's long leg (e.g. staked LIT) and its
+  // short are valued at the same price and moment. Otherwise two feeds (CoinGecko vs the exchange mark)
+  // create a fake P/L gap between legs that should cancel.
+  for (const i of pf.items) for (const pos of i.positions || []) {
+    const sym = String(pos.market || '').split('-')[0];
+    if (!sym || !(pos.markPrice > 0)) continue;
+    const row = db.prepare('SELECT symbol FROM prices WHERE symbol = ?').get(sym);
+    if (row) db.prepare('UPDATE prices SET usd_price = ?, price_date = ? WHERE symbol = ?').run(pos.markPrice, today(), sym);
+  }
+  // Items tracked in a token (e.g. Lighter LIT staking) need that token's USD price.
+  for (const i of pf.items) {
+    if (!i.currency || i.currency === 'USD') continue;
+    db.prepare('INSERT OR IGNORE INTO prices (symbol, coingecko_id) VALUES (?, ?)').run(i.currency, i.currency === 'LIT' ? 'lighter' : null);
+    if (i.impliedPrice > 0) db.prepare('UPDATE prices SET usd_price = ?, price_date = ? WHERE symbol = ? AND usd_price IS NULL').run(i.impliedPrice, today(), i.currency);
+  }
+  const prices = priceMap();
+  const byKey = Object.fromEntries(pf.items.map((i) => [i.key, i]));
+  const d = today();
+  const updated = [];
+  for (const p of linkedPositions(w.id)) {
+    if (keyProvider(p.debank_key) !== provider) continue;
+    const item = byKey[p.debank_key];
+    const px = p.currency === 'USD' ? 1 : prices[p.currency]?.usd_price;
+    const native = item?.currency && item.currency === p.currency && item.amount != null;
+    if (!item || p.closed || (!px && !native)) continue;
+    // Wallet balances: separate tokens arriving/leaving (capital moved) from price moves (profit).
+    if (item.protocol === 'Wallet' && p.currency === 'USD' && !pf.mock) {
+      const f = walletFlow(prevItems.find((i) => i.key === p.debank_key), item);
+      if (f?.significant) {
+        addEvent(p.id, { type: f.flow > 0 ? 'deposit' : 'withdrawal', date: d, amount: Math.round(Math.abs(f.flow) * 100) / 100,
+          note: f.flow > 0 ? 'Transfer in: tokens arrived (e.g. from a closed pool), not profit' : 'Transfer out: tokens left the wallet, not a loss', source: provider });
+      }
+    }
+    // One synced valuation per day and source: replace today's instead of stacking duplicates.
+    db.prepare('DELETE FROM events WHERE position_id = ? AND type = \'valuation\' AND source = ? AND date = ?').run(p.id, provider, d);
+    // A token-denominated item (e.g. Lighter LIT staking) tracked in USD: value its live token amount at
+    // today's token price. Lighter's USD share price only updates once a day, so using it would mix
+    // yesterday's LIT price on this leg with today's price on a hedge's short leg.
+    const tokenPx = item.currency && item.amount != null ? prices[item.currency] : null;
+    const liveUsd = tokenPx?.usd_price > 0 && tokenPx.price_date === d ? item.amount * tokenPx.usd_price : null;
+    const usdValue = liveUsd ?? item.netUsd;
+    addEvent(p.id, { type: 'valuation', date: d, amount: native ? item.amount : usdValue / px,
+      note: `${src.label} sync ($${usdValue.toFixed(2)}${liveUsd !== null ? ` = ${item.amount.toFixed(4)} ${item.currency} × $${tokenPx.usd_price}` : ''})`, source: provider });
+    updated.push(p.id);
+  }
+  const closed = provider === 'zerion' && !pf.mock ? await closeVanished(w, pf.items, byKey).catch((e) => { console.warn(`close detection failed: ${e.message}`); return []; }) : [];
+  let suggested = 0;
+  if (provider === 'zerion' && !pf.mock) suggested = await scanActivity(w).catch((e) => { console.warn(`activity scan failed: ${e.message}`); return 0; });
+  return { ...forClient(snapshotView(db.prepare('SELECT * FROM debank_snapshots WHERE id = ?').get(id), w.id)), updated, suggested, closed };
+}
+
+// A tracked (non-wallet) position the source no longer reports was most likely closed. If the wallet's
+// transactions show its tokens paid back, close it at that amount on that date; otherwise ask the user.
+async function closeVanished(w, items, byKey) {
+  const gone = linkedPositions(w.id).filter((p) => keyProvider(p.debank_key) === 'zerion' && !p.closed && !byKey[p.debank_key] && !p.debank_key.includes('|Wallet|'));
+  if (!gone.length) return [];
+  const history = db.prepare("SELECT items FROM debank_snapshots WHERE wallet_id = ? AND provider = 'zerion' ORDER BY id DESC LIMIT 200").all(w.id)
+    .flatMap((r) => { const m = JSON.parse(r.items); return Array.isArray(m) ? m : m.items; });
+  const pools = gone.map((p) => {
+    const last = history.find((i) => i.key === p.debank_key);
+    const lastVal = db.prepare("SELECT date, amount FROM events WHERE position_id = ? AND type = 'valuation' ORDER BY date DESC, id DESC LIMIT 1").get(p.id);
+    return last && lastVal && { id: p.id, protocol: last.protocol, chainId: last.chainId, tokens: last.tokens, name: last.name, lastValue: lastVal.amount, lastDate: lastVal.date };
+  }).filter(Boolean);
+  if (!pools.length) return [];
+  const txs = await fetchZerionTransactions(w.address, { pages: 1, chainIds: [...new Set(pools.map((x) => x.chainId))] });
+  const out = [];
+  for (const pool of pools) {
+    const exit = detectExit(pool, txs);
+    if (exit) {
+      db.exec('BEGIN');
+      try {
+        addEvent(pool.id, { type: 'valuation', date: exit.date, amount: Math.round(exit.usd * 100) / 100, note: `Exit: withdrawn to wallet (tx ${exit.hashes.map((h) => (h || '').slice(0, 10)).join(', ')}…)`, source: 'zerion' });
+        db.prepare('UPDATE positions SET closed = 1, exit_date = ? WHERE id = ?').run(exit.date, pool.id);
+        db.prepare("UPDATE suggestions SET status = 'ignored' WHERE position_id = ? AND status = 'pending' AND kind = 'close'").run(pool.id);
+        db.exec('COMMIT');
+      } catch (e) { db.exec('ROLLBACK'); throw e; }
+      console.log(`closed position #${pool.id} (${pool.name}) at $${exit.usd.toFixed(2)} on ${exit.date}`);
+      out.push({ positionId: pool.id, name: pool.name, exitUsd: exit.usd, date: exit.date, automatic: true });
+    } else {
+      const r = db.prepare('INSERT OR IGNORE INTO suggestions (position_id, kind, tx_id, date, amount_usd, detail) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(pool.id, 'close', `vanished:${pool.lastDate}`, today(), pool.lastValue, JSON.stringify({ tokens: pool.tokens.map((symbol) => ({ symbol })), app: pool.protocol, op: 'no longer reported by Zerion' }));
+      if (r.changes) out.push({ positionId: pool.id, name: pool.name, exitUsd: pool.lastValue, suggested: true });
+    }
+  }
+  return out;
+}
+
+// One-off repair for wallet positions tracked before transfer detection existed: walk the stored snapshots,
+// and record each past transfer (tokens in/out not explained by price) as capital moved, on the day it happened.
+function rebuildWalletFlows(position) {
+  const snaps = db.prepare("SELECT fetched_at, items FROM debank_snapshots WHERE wallet_id = ? AND provider = 'zerion' ORDER BY id").all(position.wallet_id)
+    .map((r) => ({ date: r.fetched_at.slice(0, 10), item: (((m) => (Array.isArray(m) ? m : m.items))(JSON.parse(r.items))).find((i) => i.key === position.debank_key) }))
+    .filter((x) => x.item && x.date >= position.entry_date);
+  db.prepare("DELETE FROM events WHERE position_id = ? AND type IN ('deposit','withdrawal') AND note LIKE 'Transfer %'").run(position.id);
+  const perDay = {};
+  for (let k = 1; k < snaps.length; k++) {
+    const f = walletFlow(snaps[k - 1].item, snaps[k].item);
+    if (f?.significant) perDay[snaps[k].date] = (perDay[snaps[k].date] || 0) + f.flow;
+  }
+  for (const [date, flow] of Object.entries(perDay)) {
+    if (Math.abs(flow) < 0.5) continue;
+    addEvent(position.id, { type: flow > 0 ? 'deposit' : 'withdrawal', date, amount: Math.round(Math.abs(flow) * 100) / 100,
+      note: flow > 0 ? 'Transfer in: tokens arrived (e.g. from a closed pool), not profit' : 'Transfer out: tokens left the wallet, not a loss', source: 'zerion' });
+    // keep that day's valuation after the transfer, so current value = last valuation
+    const v = db.prepare("SELECT * FROM events WHERE position_id = ? AND type = 'valuation' AND date = ? ORDER BY id DESC LIMIT 1").get(position.id, date);
+    if (v) { db.prepare('DELETE FROM events WHERE id = ?').run(v.id); addEvent(position.id, { type: 'valuation', date, amount: v.amount, note: v.note, source: v.source }); }
+  }
+  return perDay;
+}
+
+app.post('/api/positions/:id/rebuild-transfers', (req, res) => {
+  const p = getPosition(req.params.id);
+  if (!p.debank_key?.includes('|Wallet|')) throw new HttpError(400, 'only wallet-balance positions have transfers to rebuild');
+  res.json({ transfers: rebuildWalletFlows(p) });
+});
+
+// ---------- activity suggestions (collected fees, deposits) from Zerion transactions ----------
+async function scanActivity(w) {
+  // Open pools, plus pools closed in the last 30 days (their final fee collection often lands on the closing day).
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const tracked = db.prepare('SELECT id, debank_key, currency, closed, exit_date FROM positions WHERE wallet_id = ? AND debank_key IS NOT NULL').all(w.id)
+    .filter((p) => keyProvider(p.debank_key) === 'zerion' && p.currency === 'USD' && (!p.closed || (p.exit_date && p.exit_date >= cutoff)));
+  const history = tracked.some((p) => p.closed)
+    ? db.prepare("SELECT items FROM debank_snapshots WHERE wallet_id = ? AND provider = 'zerion' ORDER BY id DESC LIMIT 200").all(w.id)
+      .flatMap((r) => { const m = JSON.parse(r.items); return Array.isArray(m) ? m : m.items; })
+    : [];
+  const exitOf = Object.fromEntries(tracked.map((p) => [p.id, p.closed ? p.exit_date : null]));
+  const positions = tracked.map((p) => {
+    const item = latestSnapshotItem(w.id, p.debank_key) || history.find((i) => i.key === p.debank_key);
+    return item && { id: p.id, protocol: item.protocol, chainId: item.chainId, tokens: item.tokens, valueUsd: item.netUsd };
+  }).filter(Boolean);
+  if (!positions.length) return 0;
+  const txs = (await fetchZerionTransactions(w.address, { chainIds: [...new Set(positions.map((p) => p.chainId))] }))
+    .filter((t) => !w.track_from || t.date >= w.track_from);
+  const ins = db.prepare('INSERT OR IGNORE INTO suggestions (position_id, kind, tx_id, date, amount_usd, detail) VALUES (?, ?, ?, ?, ?, ?)');
+  let n = 0;
+  for (const m of matchTransactions(txs, positions).filter((x) => !exitOf[x.positionId] || x.tx.date <= exitOf[x.positionId])) {
+    const detail = { tokens: (m.kind === 'fee' ? m.tx.in : m.tx.out).map((x) => ({ symbol: x.symbol, qty: x.qty, usd: x.usd })), app: m.tx.app, hash: m.tx.hash, op: m.tx.op };
+    n += ins.run(m.positionId, m.kind, m.tx.id, m.tx.date, m.usd, JSON.stringify(detail)).changes;
+  }
+  return n;
+}
+
+app.post('/api/wallets/:id/scan-activity', wrap(async (req, res) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
+  if (!w) throw new HttpError(404, 'wallet not found');
+  if (zerionMode() !== 'live') throw new HttpError(400, 'Scanning transactions needs ZERION_API_KEY.');
+  res.json({ suggested: await scanActivity(w) });
+}));
+
+app.get('/api/suggestions', (req, res) => {
+  const rows = db.prepare(`SELECT s.*, p.protocol, p.chain, p.deposit, p.entry_date, p.comments FROM suggestions s JOIN positions p ON p.id = s.position_id
+    WHERE s.status = ? ${req.query.position ? 'AND s.position_id = ?' : ''} ORDER BY s.date DESC, s.id DESC`)
+    .all(...[req.query.status || 'pending', ...(req.query.position ? [req.query.position] : [])]);
+  res.json(rows.map((r) => ({ ...r, detail: JSON.parse(r.detail || '{}') })));
+});
+
+// fee → a Reward event on the position. deposit → the position's deposit becomes the total of its confirmed
+// deposit transactions and its entry date the earliest of them (replacing the "value on import day" default).
+app.post('/api/suggestions/:id/apply', (req, res) => {
+  const sg = db.prepare("SELECT * FROM suggestions WHERE id = ? AND status = 'pending'").get(req.params.id);
+  if (!sg) throw new HttpError(404, 'suggestion not found or already handled');
+  db.exec('BEGIN');
+  try {
+    if (sg.kind === 'close') {
+      // Confirmed close without a matching transaction: exit at the last known value.
+      const p = getPosition(sg.position_id);
+      const lastVal = db.prepare("SELECT date FROM events WHERE position_id = ? AND type = 'valuation' ORDER BY date DESC, id DESC LIMIT 1").get(p.id);
+      const exitDate = lastVal?.date && lastVal.date > sg.date ? lastVal.date : sg.date;
+      addEvent(p.id, { type: 'valuation', date: exitDate, amount: Math.round(sg.amount_usd * 100) / 100, note: 'Exit: confirmed closed (no longer reported by the source)', source: 'manual' });
+      db.prepare('UPDATE positions SET closed = 1, exit_date = ? WHERE id = ?').run(exitDate, p.id);
+      db.prepare("UPDATE suggestions SET status = 'applied' WHERE id = ?").run(sg.id);
+    } else if (sg.kind === 'fee') {
+      const d = JSON.parse(sg.detail || '{}');
+      const eid = addEvent(sg.position_id, { type: 'reward', date: sg.date, amount: Math.round(sg.amount_usd * 100) / 100, note: `Collected fees: ${(d.tokens || []).map((t) => t.symbol).join(' + ')}${d.hash ? ` (tx ${d.hash.slice(0, 10)}…)` : ''}`, source: 'zerion' });
+      db.prepare("UPDATE suggestions SET status = 'applied', event_id = ? WHERE id = ?").run(Number(eid), sg.id);
+    } else {
+      db.prepare("UPDATE suggestions SET status = 'applied' WHERE id = ?").run(sg.id);
+      const agg = db.prepare("SELECT SUM(amount_usd) total, MIN(date) first FROM suggestions WHERE position_id = ? AND kind = 'deposit' AND status = 'applied'").get(sg.position_id);
+      db.prepare('UPDATE positions SET deposit = ?, entry_date = ? WHERE id = ?').run(Math.round(agg.total * 100) / 100, agg.first, sg.position_id);
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  res.json({ ok: true });
+});
+
+app.post('/api/suggestions/:id/ignore', (req, res) => {
+  db.prepare("UPDATE suggestions SET status = 'ignored' WHERE id = ? AND status = 'pending'").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Latest snapshot per wallet and source, reduced to the items not yet tracked as positions.
+function untrackedHoldings(walletFilter, providerFilter) {
+  const wallets = db.prepare('SELECT id, name FROM wallets').all();
+  const latest = db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1');
+  const out = [];
+  for (const w of wallets) {
+    if (walletFilter === 'none' || (walletFilter && String(w.id) !== String(walletFilter))) continue;
+    for (const provider of Object.keys(PROVIDERS)) {
+      if (providerFilter && provider !== providerFilter) continue;
+      const v = snapshotView(latest.get(w.id, provider), w.id);
+      if (!v || v.mock) continue;
+      const items = v.items.filter((i) => !i.positionId && i.netUsd > 0);
+      if (items.length) out.push({ walletId: w.id, wallet: w.name, provider, fetchedAt: v.fetchedAt, totalUsd: v.totalUsd, untrackedUsd: items.reduce((a, i) => a + i.netUsd, 0), items });
+    }
+  }
+  return out;
+}
+
+const positionLabel = (i) => {
+  if (i.protocol === 'Wallet') return i.tokens.length === 1 ? `Wallet · ${i.tokens[0]}` : 'Wallet balance';
+  if (i.protocolId === 'lighter') return `Lighter · ${i.name.replace('Lighter Liquidity Provider (LLP)', 'LLP').replace(/ #\d+$/, '')}`;
+  return i.protocol;
+};
+
+// Track every untracked item from the wallet's latest sync(s). Uses the deposit and entry date the source
+// reports (Lighter, Extended); otherwise the deposit is today's value, so profit is measured from today.
+app.post('/api/wallets/:id/track-all', (req, res) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
+  if (!w) throw new HttpError(404, 'wallet not found');
+  const holdings = untrackedHoldings(w.id, text(req.query.provider));
+  const d = today();
+  const ins = db.prepare(`INSERT INTO positions (wallet_id, strategy, protocol, chain, currency, entry_date, deposit, comments, debank_key)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  let created = 0;
+  const r2 = (x) => Math.round(x * 1e6) / 1e6;
+  db.exec('BEGIN');
+  try {
+    for (const h of holdings) {
+      const label = PROVIDERS[h.provider]?.label || h.provider;
+      for (const i of h.items) {
+        const currency = i.trackUsd ? 'USD' : i.currency || 'USD';
+        const livePx = i.currency ? db.prepare('SELECT usd_price, price_date FROM prices WHERE symbol = ?').get(i.currency) : null;
+        const liveUsd = i.amount != null && livePx?.usd_price > 0 && livePx.price_date === d ? i.amount * livePx.usd_price : null;
+        const value = i.trackUsd ? liveUsd ?? i.netUsd : i.amount ?? i.netUsd; // in the position's currency
+        const reportedDeposit = i.depositAmount ?? i.depositUsd;
+        const reported = reportedDeposit > 0;
+        const deposit = r2(reported ? reportedDeposit : value);
+        const entry = reported && i.entryDate ? i.entryDate : d;
+        const note = i.rebased === 'price' ? `held before the wallet's start date: valued at $${+i.startPrice.toPrecision(6)} ${i.currency} on ${i.entryDate}`
+          : i.rebasedPositions?.length ? `open positions before the start date restated at that day's price (${i.rebasedPositions.map((r) => `${r.market} $${+r.price.toPrecision(6)}`).join(', ')})`
+          : reported ? `deposit${i.entryDate ? ' and entry date' : ''} reported by ${label}` : `deposit set to value on ${d} — edit if you know the original deposit`;
+        const id = Number(ins.run(w.id, i.strategy, positionLabel(i), i.chain, currency, entry, deposit, `${i.name} · ${i.tokens.join('/')} (imported from ${label}; ${note})`, i.key).lastInsertRowid);
+        addEvent(id, { type: 'valuation', date: d, amount: r2(value), note: `${label} sync`, source: h.provider });
+        if (currency === 'USD') backfillHistory(id, w.id, i.key, 'USD', d, entry);
+        created++;
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  res.json({ created });
+});
+
+// ---------- exposure & hedges ----------
+// Legs come from each open tracked position's latest synced data: token holdings (long) and perps (±).
+function exposureLegs(rows) {
+  const prices = priceMap();
+  const legs = [];
+  for (const r of rows) {
+    if (r.metrics.status !== 'Open' || !r.debank_key || !r.wallet_id) continue;
+    const raw = latestSnapshotItem(r.wallet_id, r.debank_key);
+    if (!raw) continue;
+    const item = raw.flows ? accountSince(raw, r.entry_date, historicalPrices(r.entry_date)) : raw;
+    const venue = item.protocol === 'Wallet' ? `Wallet (${r.chain})` : item.protocol || sourceLabel(r.debank_key);
+    const holds = (item.exposure || []).filter((e) => e.qty);
+    const perps = item.positions || [];
+    const pure = holds.length === 1 && !perps.length; // the position is exposure to this one asset only
+    for (const e of holds) {
+      const single = pure && item.netUsd > 0 ? item.netUsd / e.qty : null;
+      legs.push({ positionId: r.id, label: r.protocol, venue, chain: r.chain, symbol: e.symbol, qty: e.qty, kind: 'hold',
+        priceUsd: e.priceUsd || prices[underlying(e.symbol)]?.usd_price || prices[e.symbol]?.usd_price || single, pure, pnlUsd: pure ? r.metrics.pnlUsd : null, valueUsd: r.metrics.valueUsd });
+    }
+    for (const p of perps) {
+      legs.push({ positionId: r.id, label: `${p.market} ${String(p.side).toLowerCase()}`, venue, chain: r.chain, symbol: p.market.split('-')[0],
+        qty: String(p.side).toUpperCase() === 'SHORT' ? -p.size : p.size, kind: 'perp', priceUsd: p.markPrice, perp: p });
+    }
+  }
+  return legs;
+}
+const sourceLabel = (key) => PROVIDERS[keyProvider(key)]?.label || '';
+
+function hedgeReport(rows) {
+  const exposure = computeExposure(exposureLegs(rows));
+  const hedges = detectHedges(exposure).map((h) => {
+    const allPure = h.longs.every((l) => l.pure && l.pnlUsd !== null);
+    const longPnl = allPure ? h.longs.reduce((a, l) => a + l.pnlUsd, 0) : null;
+    return { ...h, longPnl, combinedPnl: longPnl === null ? null : longPnl + h.perpPnl + h.perpCarry };
+  });
+  return { exposure: exposure.map(({ legs, ...a }) => ({ ...a, legs: legs.map(({ perp, ...l }) => l) })), hedges };
+}
+
+app.get('/api/hedges', (_req, res) => res.json(hedgeReport(loadPositions())));
+
+app.post('/api/wallets/:id/sync', wrap(async (req, res) => res.json(await syncWallet(req.params.id, req.query.provider || req.body?.provider))));
+app.post('/api/wallets/:id/debank-sync', wrap(async (req, res) => res.json(await syncWallet(req.params.id, 'debank'))));
+
+// ---------- prices ----------
+app.get('/api/prices', (_req, res) => res.json(db.prepare('SELECT * FROM prices ORDER BY rowid').all()));
+
+app.post('/api/prices', (req, res) => {
+  const symbol = text(req.body.symbol);
+  if (!symbol) throw new HttpError(400, 'symbol is required');
+  db.prepare('INSERT OR IGNORE INTO prices (symbol, coingecko_id) VALUES (?, ?)').run(symbol, text(req.body.coingecko_id));
+  res.status(201).json({ ok: true });
+});
+
+app.put('/api/prices/:symbol', (req, res) => {
+  const price = num(req.body.usd_price);
+  if (price !== null && !(price > 0)) throw new HttpError(400, 'price must be positive');
+  const date = text(req.body.price_date) || (price !== null ? today() : null);
+  db.prepare('UPDATE prices SET usd_price = ?, price_date = ?, coingecko_id = ? WHERE symbol = ?')
+    .run(price, date, text(req.body.coingecko_id), req.params.symbol);
+  res.json({ ok: true });
+});
+
+app.delete('/api/prices/:symbol', (req, res) => {
+  db.prepare('DELETE FROM prices WHERE symbol = ?').run(req.params.symbol);
+  res.json({ ok: true });
+});
+
+async function refreshPrices() {
+  const rows = db.prepare('SELECT * FROM prices').all();
+  const ids = [...new Set(rows.map((r) => r.coingecko_id).filter(Boolean))];
+  const { data, eurUsd } = await fetchCoingeckoPrices(ids);
+  const d = today();
+  const upd = db.prepare('UPDATE prices SET usd_price = ?, price_date = ? WHERE symbol = ?');
+  let n = 0;
+  for (const r of rows) {
+    const p = r.symbol === 'USD' ? 1 : r.symbol === 'EUR' ? eurUsd : data[r.coingecko_id]?.usd;
+    if (p > 0) { upd.run(p, d, r.symbol); n++; }
+  }
+  return { updated: n, total: rows.length };
+}
+app.post('/api/prices/refresh', wrap(async (_req, res) => res.json(await refreshPrices())));
+
+// ---------- backup ----------
+app.get('/api/export', (_req, res) => {
+  res.set('Content-Disposition', `attachment; filename="defi-tracker-${today()}.json"`);
+  res.json({
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    wallets: db.prepare('SELECT * FROM wallets').all(),
+    positions: db.prepare('SELECT * FROM positions').all(),
+    events: db.prepare('SELECT * FROM events').all(),
+    prices: db.prepare('SELECT * FROM prices').all(),
+  });
+});
+
+const csvCell = (v) => (v === null || v === undefined ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+app.get('/api/export.csv', (_req, res) => {
+  const cols = ['Wallet', 'Strategy', 'Protocol', 'Chain', 'Currency', 'Entry Date', 'Exit Date', 'Valuation Date', 'Deposit', 'Current Value', 'Distributed Rewards', 'Additional Fees', 'Expected Annual Return', 'Profit / Loss', 'Total Return', 'Annualized Return', 'Duration (Days)', 'Status', 'Comments', 'USD Price', 'Profit / Loss USD', 'USD Price Date', 'Withdrawal'];
+  const lines = [cols.join(',')];
+  for (const p of loadPositions()) {
+    const m = p.metrics;
+    lines.push([p.wallet, p.strategy, p.protocol, p.chain, p.currency, p.entry_date, p.exit_date, m.valuationDate, p.deposit, m.currentValue, m.rewards, m.fees, p.expected_return, m.pnl, m.totalReturn, m.annualized, m.duration, m.status, p.comments, m.usdPrice, m.pnlUsd, m.usdPriceDate, m.withdrawals].map(csvCell).join(','));
+  }
+  res.set('Content-Type', 'text/csv').set('Content-Disposition', `attachment; filename="defi-positions-${today()}.csv"`).send(lines.join('\n'));
+});
+
+app.post('/api/import', (req, res) => {
+  const b = req.body;
+  if (b?.version !== 1 || !Array.isArray(b.positions)) throw new HttpError(400, 'not a BitBlock DeFi Tracker export file');
+  db.exec('BEGIN');
+  try {
+    db.exec('DELETE FROM suggestions; DELETE FROM events; DELETE FROM positions; DELETE FROM debank_snapshots; DELETE FROM wallets;');
+    const ins = (table, rows) => {
+      const allowed = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+      for (const r of rows || []) {
+        const keys = Object.keys(r).filter((k) => allowed.has(k));
+        db.prepare(`INSERT OR REPLACE INTO ${table} (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(...keys.map((k) => r[k]));
+      }
+    };
+    ins('wallets', b.wallets); ins('positions', b.positions); ins('events', b.events); ins('prices', b.prices);
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw new HttpError(400, `import failed: ${e.message}`); }
+  res.json({ ok: true, positions: b.positions.length });
+});
+
+// Background sync so every tracked position gets a fresh valuation (a new chart point) without clicking.
+let syncing = null;
+async function syncAll(trigger = 'auto') {
+  const results = [];
+  const wallets = db.prepare("SELECT * FROM wallets WHERE address IS NOT NULL AND kind != 'manual'").all();
+  for (const w of wallets) {
+    for (const [id, src] of Object.entries(PROVIDERS)) {
+      if (src.mode() !== 'live' || !src.kinds.includes(w.kind) || (src.allows && !src.allows(w))) continue;
+      try {
+        const r = await syncWallet(w.id, id);
+        results.push({ wallet: w.name, source: src.label, ok: true, items: r.items.length, updated: r.updated.length, suggested: r.suggested || 0, closedList: r.closed || [] });
+        console.log(`${trigger}-sync ${w.name} via ${src.label}: ${r.items.length} item(s), ${r.updated.length} updated`);
+      } catch (e) {
+        results.push({ wallet: w.name, source: src.label, ok: false, error: e.message });
+        console.warn(`${trigger}-sync ${w.name} via ${src.label} failed: ${e.message}`);
+      }
+    }
+  }
+  lastSyncAt = new Date().toISOString();
+  return results;
+}
+let lastSyncAt = null;
+// Runs one sync at a time; a second click while one is running waits for the same run.
+const runSync = (trigger) => (syncing ??= syncAll(trigger).finally(() => { syncing = null; }));
+const autoSync = async () => { await refreshPrices().catch((e) => console.warn(`price refresh failed: ${e.message}`)); return runSync('auto'); };
+
+app.post('/api/sync-all', wrap(async (_req, res) => {
+  const prices = await refreshPrices().catch(() => null);
+  const results = await runSync('manual');
+  res.json({ results, prices, lastSyncAt });
+}));
+app.get('/api/sync-status', (_req, res) => res.json({ lastSyncAt, running: !!syncing }));
+if (AUTO_SYNC_HOURS > 0) {
+  setTimeout(autoSync, 60_000);
+  setInterval(autoSync, AUTO_SYNC_HOURS * 3_600_000);
+}
+
+// ---------- errors ----------
+app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: err.message });
+});
+
+app.listen(PORT, () => console.log(`BitBlock DeFi Tracker listening on http://localhost:${PORT} (DeBank: ${debankMode()}, Zerion: ${zerionMode()}, Lighter: ${lighterMode()}, Extended: ${extendedMode()}, auto-sync: ${AUTO_SYNC_HOURS ? `every ${AUTO_SYNC_HOURS}h` : 'off'})`));

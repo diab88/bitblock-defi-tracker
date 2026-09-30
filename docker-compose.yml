@@ -1,0 +1,16 @@
+services:
+  defi-tracker:
+    build: .
+    image: bitblock-defi-tracker:latest
+    container_name: defi-tracker
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8090}:8080"   # localhost only; drop "127.0.0.1:" to expose on your network
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - defi-data:/data
+    restart: unless-stopped
+
+volumes:
+  defi-data:
