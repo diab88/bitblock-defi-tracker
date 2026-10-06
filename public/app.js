@@ -143,7 +143,7 @@ function openPortfolioManager() {
 }
 
 // ---------- router ----------
-const routes = { dashboard: renderDashboard, positions: renderPositions, wallets: renderWallets, prices: renderPrices, guide: renderGuide };
+const routes = { dashboard: renderDashboard, positions: renderPositions, wallets: renderWallets, prices: renderPrices, settings: renderSettings, guide: renderGuide };
 async function route() {
   const name = (location.hash.replace('#/', '') || 'dashboard').split('?')[0];
   $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === name));
@@ -800,6 +800,12 @@ const sourceOf = (key) => SOURCES[key?.split('|')[0]]?.label || 'DeBank';
 const snapCache = {};
 
 function sourcesBanner() {
+  const on = Object.entries(SOURCES).filter(([id]) => meta[id] === 'live').map(([, s]) => s.label);
+  const off = Object.entries(SOURCES).filter(([id]) => meta[id] === 'off').map(([, s]) => s.label);
+  return `<div class="banner"><span>ℹ</span><div style="flex:1"><strong>Step 1: data sources</strong> (set up once, used by every wallet): ${on.length ? `${esc(on.join(', '))} connected` : 'none connected yet'}${off.length ? ` · ${esc(off.join(', '))} not set up` : ''}.
+    <a href="#/settings">Manage data sources →</a><br><strong>Step 2: wallets</strong> (below): add each address once; then <em>Sync</em> pulls its positions from the connected sources.</div></div>`;
+}
+function sourcesBannerDetailed() {
   const rows = Object.entries(SOURCES).map(([id, s]) => {
     const mode = meta[id];
     const state = mode === 'live' ? '<span class="pill open"><span class="dot"></span>Connected</span>'
@@ -1015,6 +1021,52 @@ async function renderPrices() {
   async (f) => { await api('POST', '/api/prices', f); rerender(); });
 }
 
+// ---------- data sources (API keys) ----------
+async function renderSettings() {
+  const st = await api('GET', '/api/settings');
+  const pill = (mode) => (mode === 'live' ? '<span class="pill open"><span class="dot"></span>Connected</span>'
+    : mode === 'mock' ? '<span class="pill warn"><span class="dot"></span>Demo data</span>' : '<span class="pill"><span class="dot"></span>Not set up</span>');
+  view.innerHTML = `<div class="page-head"><div><div class="eyebrow">Setup</div><h1>Data sources</h1>
+      <p>Data sources read what’s inside your wallets. Set them up once here; every wallet in every portfolio then syncs from them. Wallets themselves are added on the <a href="#/wallets">Wallets</a> page.</p></div></div>
+    ${st.envFile.writable ? '' : `<div class="banner"><span>⚠</span><div><strong>Keys can’t be saved to .env:</strong> ${esc(st.envFile.reason || '')}. Keys you enter still work until the app restarts. To make them permanent, run <code>cp .env.example .env</code> in the app folder, then <code>docker compose up -d</code>, and enter them again.</div></div>`}
+    <section class="stack">
+      <div class="card"><div class="card-head"><div><h2>Lighter ${pill(st.lighter)}</h2><p>Perps account, LLP / public pools and LIT staking, with deposits and daily history. Public API: no key needed.</p></div></div></div>
+      ${st.sources.map((s) => `<div class="card" data-src="${s.id}"><div class="card-head"><div><h2>${esc(s.label)} ${pill(s.mode)}</h2><p>${esc(s.what)}</p></div>
+          ${s.configured ? `<div class="actions"><span class="tag" title="Only the last 4 characters are shown">${esc(s.masked)}</span><button class="btn sm" data-test>Test connection</button><button class="btn sm danger" data-remove>Remove key</button></div>` : ''}</div>
+        <form class="form" data-key-form autocomplete="off">
+          <label class="full">${s.configured ? 'Replace key' : 'API key'} <span class="hint">get one at <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url.replace('https://', ''))}</a>. It’s checked with ${esc(s.label)} before saving, and stored in your .env file as ${esc(s.env)}.</span>
+            <div style="display:flex;gap:8px"><input name="key" type="password" placeholder="Paste your ${esc(s.label)} key" autocomplete="new-password" spellcheck="false" style="flex:1"><button class="btn primary" type="submit">Save &amp; test</button></div></label>
+          <p class="full muted" data-result style="margin:0;font-size:12px"></p>
+        </form></div>`).join('')}
+    </section>
+    <p class="muted" style="font-size:12px;margin-top:14px">Keys stay on this computer, in the app’s .env file. The app never shows them again (only the last 4 characters) and changing them is only allowed from this computer, unless APP_PASSWORD protects the app.</p>`;
+
+  for (const s of st.sources) {
+    const card = $(`[data-src="${s.id}"]`);
+    const result = $('[data-result]', card);
+    $('[data-key-form]', card).onsubmit = guard(async (e) => {
+      e.preventDefault();
+      const btn = $('button[type=submit]', card), input = $('input[name=key]', card);
+      btn.disabled = true; btn.textContent = 'Testing…'; result.textContent = '';
+      try {
+        const r = await api('PUT', `/api/settings/${s.id}`, { key: input.value });
+        input.value = '';
+        toast(`${s.label} connected${r.saved ? ' and saved to .env' : ''}`);
+        if (r.warning) toast(r.warning, true);
+        await loadMeta(); rerender();
+      } catch (err) { result.textContent = err.message; result.className = 'full neg'; }
+      finally { btn.disabled = false; btn.textContent = 'Save & test'; }
+    });
+    $('[data-test]', card)?.addEventListener('click', guard(async (e) => {
+      e.target.disabled = true; e.target.textContent = 'Testing…';
+      try { const r = await api('POST', `/api/settings/${s.id}/test`); toast(r.ok ? `${s.label}: ${r.message}` : `${s.label}: ${r.message}`, !r.ok); }
+      finally { e.target.disabled = false; e.target.textContent = 'Test connection'; }
+    }));
+    $('[data-remove]', card)?.addEventListener('click', () => confirmModal(`Remove the ${s.label} key?`, `${s.label} stops syncing until you add a key again. Positions already tracked are kept.`, 'Remove key',
+      async () => { await api('DELETE', `/api/settings/${s.id}`); toast(`${s.label} key removed`); await loadMeta(); rerender(); }));
+  }
+}
+
 // ---------- guide ----------
 function renderGuide() {
   view.innerHTML = `<div class="guide"><div class="page-head"><div><h1>Guide</h1><p>How the app maps to the BitBlock Excel tracker.</p></div></div>
@@ -1039,6 +1091,8 @@ function renderGuide() {
     <li><strong>Collected fees</strong> leave the pool and land in your wallet. They count as rewards: profit = value + withdrawals + rewards − fees − deposit.</li>
     <li>With Zerion connected, each sync scans your transactions and suggests collected fees and deposits for your tracked pools. Confirm them on the Dashboard, the Positions page, or inside a position. Anything it can’t match confidently (e.g. a token that’s in several pools) is skipped; add those with <em>Reward</em> yourself.</li>
   </ul>
+  <h2>Setting up: data sources, then wallets</h2>
+  <p><strong>1. Data sources</strong> (sidebar → <em>Data sources</em>): paste your Zerion, DeBank or Extended API key once; it’s tested and saved to the app’s .env file. Lighter needs no key. <strong>2. Wallets</strong>: add each address (connect MetaMask/Phantom/Trust Wallet, or paste it). <em>Sync</em> then pulls each wallet’s positions from every connected source.</p>
   <h2>Portfolios</h2>
   <p>Use the <em>Portfolio</em> switcher in the sidebar to create, name and switch portfolios. Each has its own wallets, positions, totals and suggestions, and <em>Sync all</em> only syncs the active one. A portfolio can mix wallet types (MetaMask, Phantom, Trust Wallet, watched addresses). Market prices are shared by all portfolios.</p>
   <h2>Rewards and corrections</h2>

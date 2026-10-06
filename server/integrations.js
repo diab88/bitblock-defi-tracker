@@ -683,6 +683,25 @@ export async function fetchCoingeckoHistory(id, date) {
   return (await res.json())?.market_data?.current_price?.usd ?? null;
 }
 
+// Check an API key with one cheap authenticated call. 401/403 = rejected; anything else unexpected = unknown.
+export async function testProviderKey(provider, key) {
+  const req = {
+    zerion: () => fetch(`${ZERION_BASE}/chains/`, { headers: { authorization: `Basic ${Buffer.from(`${key}:`).toString('base64')}`, accept: 'application/json' } }),
+    debank: () => fetch(`${DEBANK_BASE}/v1/account/units`, { headers: { AccessKey: key, accept: 'application/json' } }),
+    extended: () => fetch(`${EXTENDED_BASE}/user/balance`, { headers: { 'X-Api-Key': key, 'User-Agent': 'BitBlockDeFiTracker/1.0', accept: 'application/json' } }),
+  }[provider];
+  if (!req) return { ok: false, message: 'unknown provider' };
+  try {
+    const res = await req();
+    if (res.ok || (provider === 'extended' && res.status === 404)) return { ok: true, message: 'Key accepted' }; // Extended: 404 = empty account
+    if (res.status === 401 || res.status === 403) return { ok: false, message: `The ${provider} API rejected this key (HTTP ${res.status})` };
+    if (res.status === 429) return { ok: false, message: 'Rate limited by the provider; try again in a minute' };
+    return { ok: false, message: `Unexpected response from ${provider} (HTTP ${res.status})` };
+  } catch (e) {
+    return { ok: false, message: `Couldn’t reach ${provider}: ${e.message}` };
+  }
+}
+
 export async function fetchCoingeckoPrices(ids) {
   const url = `https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=${ids.join(',')}`;
   const res = await fetch(url, { headers: { accept: 'application/json' } });

@@ -7,12 +7,12 @@ It runs as a single Docker container with a SQLite file for storage.
 ## Run
 
 ```bash
-cp .env.example .env        # optional: add DEBANK_ACCESS_KEY, APP_PASSWORD
+cp .env.example .env        # required: the app saves API keys here (Data sources page)
 docker compose up -d --build
 open http://localhost:8090
 ```
 
-Change the port with `HOST_PORT=9000 docker compose up -d`. Data persists in the `defi-data` volume.
+Change the port or container name with `HOST_PORT=9000 CONTAINER_NAME=defi-tracker-2 docker compose up -d`. Data persists in the `defi-data` volume.
 Wipe everything (including demo data) with `docker compose down -v`.
 
 Without Docker: `npm install && npm start` (Node ≥ 22.13), served on http://localhost:8080.
@@ -76,6 +76,13 @@ This is a single-user app. A multi-tenant SaaS would need real user accounts and
   *Correction history* and can be undone.
 - **Your target:** the optional *Target annual return* on a position (simple APR). Never defaulted. *vs. target* =
   simple annualized − target, shown once a position has 30+ days.
+
+### API keys: the Data sources page
+
+Sidebar → **Data sources**: paste a Zerion, DeBank or Extended key. It's tested against the provider, saved to
+`.env` (which `docker-compose.yml` bind-mounts into the container), and applied immediately, with no restart.
+Keys are shown only as `••••1a2b`, and changing them is limited to this computer unless `APP_PASSWORD` is set.
+You can still edit `.env` by hand and run `docker compose up -d`.
 
 ### Upgrading an existing install
 

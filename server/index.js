@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { openDb, CHAINS, STRATEGIES } from './db.js';
 import { computeExposure, detectHedges, underlying } from './hedges.js';
 import { computePosition, summarizeByCurrency, portfolioSeries, positionSeries } from './calc.js';
-import { fetchCoingeckoHistory } from './integrations.js';
+import { fetchCoingeckoHistory, testProviderKey } from './integrations.js';
+import { KEYED_SOURCES, validateKey, maskKey, envFilePath, envFileStatus, writeEnvValue } from './settings.js';
 import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExits, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, isEvmAddress, isSolanaAddress } from './integrations.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -930,6 +931,63 @@ async function refreshPrices() {
 }
 app.post('/api/prices/refresh', wrap(async (_req, res) => res.json(await refreshPrices())));
 
+// ---------- settings: API keys ----------
+// Keys are kept in .env (see server/settings.js) and applied to the running app at once. The browser only
+// ever sees a masked form. Changing keys is limited to this computer unless APP_PASSWORD protects the app.
+const ENV_FILE = envFilePath(root);
+const isLocalHost = (req) => /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(req.get('host') || '');
+const settingsWriteGuard = (req) => {
+  if (!process.env.APP_PASSWORD && !isLocalHost(req)) throw new HttpError(403, 'Set APP_PASSWORD before changing API keys over the network.');
+};
+const sourceOrThrow = (id) => { const s = KEYED_SOURCES[id]; if (!s) throw new HttpError(404, 'unknown data source'); return s; };
+const modeOf = { zerion: zerionMode, debank: debankMode, extended: extendedMode };
+
+app.get('/api/settings', (_req, res) => {
+  const file = envFileStatus(ENV_FILE);
+  res.json({
+    envFile: { ...file, path: process.env.ENV_FILE ? ENV_FILE : '.env' },
+    sources: Object.entries(KEYED_SOURCES).map(([id, s]) => ({
+      id, label: s.label, env: s.env, url: s.url, what: s.what,
+      configured: !!process.env[s.env], masked: maskKey(process.env[s.env]), mode: modeOf[id](),
+    })),
+    lighter: lighterMode(),
+  });
+});
+
+// Save a key: validate → test it against the provider (unless test=false) → write .env → apply now.
+app.put('/api/settings/:id', wrap(async (req, res) => {
+  settingsWriteGuard(req);
+  const src = sourceOrThrow(req.params.id);
+  const v = validateKey(req.body?.key);
+  if (!v.ok) throw new HttpError(400, v.error);
+  if (req.body?.test !== false) {
+    const t = await testProviderKey(req.params.id, v.key);
+    if (!t.ok) throw new HttpError(400, `${t.message}. The key was not saved.`);
+  }
+  const file = envFileStatus(ENV_FILE);
+  let saved = false;
+  if (file.writable) { writeEnvValue(ENV_FILE, src.env, v.key); saved = true; }
+  process.env[src.env] = v.key;
+  console.log(`settings: ${src.env} updated${saved ? ' in .env' : ' for this session only (.env not writable)'}`);
+  res.json({ ok: true, masked: maskKey(v.key), saved, mode: modeOf[req.params.id](),
+    warning: saved ? null : `Applied until the app restarts, but not saved: ${file.reason}. Add it to .env by hand to keep it.` });
+}));
+
+app.delete('/api/settings/:id', (req, res) => {
+  settingsWriteGuard(req);
+  const src = sourceOrThrow(req.params.id);
+  const file = envFileStatus(ENV_FILE);
+  if (file.writable) writeEnvValue(ENV_FILE, src.env, '');
+  delete process.env[src.env];
+  res.json({ ok: true, saved: file.writable, mode: modeOf[req.params.id]() });
+});
+
+app.post('/api/settings/:id/test', wrap(async (req, res) => {
+  const src = sourceOrThrow(req.params.id);
+  if (!process.env[src.env]) throw new HttpError(400, `No ${src.label} key is set`);
+  res.json(await testProviderKey(req.params.id, process.env[src.env]));
+}));
+
 // ---------- backup ----------
 // Full backup of every portfolio (version 2 adds portfolios and correction history; version 1 files still import).
 app.get('/api/export', (_req, res) => {
@@ -1034,4 +1092,4 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: err.message });
 });
 
-app.listen(PORT, () => console.log(`BitBlock DeFi Tracker listening on http://localhost:${PORT} (DeBank: ${debankMode()}, Zerion: ${zerionMode()}, Lighter: ${lighterMode()}, Extended: ${extendedMode()}, auto-sync: ${AUTO_SYNC_HOURS ? `every ${AUTO_SYNC_HOURS}h` : 'off'})`));
+app.listen(PORT, () => console.log(`BitBlock DeFi Tracker is running: open http://localhost:${process.env.PUBLIC_PORT || PORT} (DeBank: ${debankMode()}, Zerion: ${zerionMode()}, Lighter: ${lighterMode()}, Extended: ${extendedMode()}, auto-sync: ${AUTO_SYNC_HOURS ? `every ${AUTO_SYNC_HOURS}h` : 'off'})`));

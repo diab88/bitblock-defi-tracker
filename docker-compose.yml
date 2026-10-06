@@ -2,14 +2,22 @@ services:
   defi-tracker:
     build: .
     image: bitblock-defi-tracker:latest
-    container_name: defi-tracker
+    container_name: ${CONTAINER_NAME:-defi-tracker}
     ports:
       - "127.0.0.1:${HOST_PORT:-8090}:8080"   # localhost only; drop "127.0.0.1:" to expose on your network
     env_file:
       - path: .env
         required: false
+    environment:
+      PUBLIC_PORT: ${HOST_PORT:-8090}         # only used to print the right address at startup
     volumes:
       - defi-data:/data
+      # Lets Settings in the app save API keys to this .env file. Create it first: cp .env.example .env
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        bind:
+          create_host_path: false
     restart: unless-stopped
 
 volumes:

@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'defi-api-test-'));
 const PORT = 18000 + Math.floor(Math.random() * 1000);
@@ -12,8 +13,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 let server;
 
 before(async () => {
+  fs.writeFileSync(path.join(dir, '.env'), '# test env\nZERION_API_KEY=\nZERION_MOCK=1\nAPP_PASSWORD=\n');
   server = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'server/index.js'], {
-    env: { ...process.env, PORT: String(PORT), DB_PATH: path.join(dir, 'test.db'), AUTO_SYNC_HOURS: '0',
+    env: { ...process.env, PORT: String(PORT), DB_PATH: path.join(dir, 'test.db'), AUTO_SYNC_HOURS: '0', ENV_FILE: path.join(dir, '.env'), APP_PASSWORD: '',
       ZERION_MOCK: '1', DEBANK_MOCK: '0', LIGHTER_DISABLED: '1', ZERION_API_KEY: '', DEBANK_ACCESS_KEY: '', EXTENDED_API_KEY: '' },
     stdio: 'ignore',
   });
@@ -178,4 +180,39 @@ test('portfolios with data cannot be deleted; empty ones can', async () => {
   await ok('DELETE', `/api/portfolios/${C}`);
   // An unknown portfolio id falls back to the first portfolio instead of failing.
   assert.ok((await ok('GET', '/api/positions', null, 99999)).some((p) => p.protocol === 'A-pos'));
+});
+
+test('Data sources: a key saved in the UI goes to .env, applies at once, and is never shown again', async () => {
+  const envFile = path.join(dir, '.env');
+  let st = await ok('GET', '/api/settings');
+  assert.equal(st.envFile.writable, true);
+  assert.equal(st.sources.find((s) => s.id === 'zerion').configured, false);
+  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'bad key with spaces' })).status, 400);
+  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'zk_test_12345678\nAPP_PASSWORD=x' })).status, 400);
+  assert.equal((await call('PUT', '/api/settings/nope', { key: 'zk_test_12345678' })).status, 404);
+  const r = await ok('PUT', '/api/settings/zerion', { key: 'zk_test_1234abcd', test: false });
+  assert.equal(r.masked, '••••abcd');
+  assert.equal(r.saved, true);
+  assert.equal(r.mode, 'live');                                         // applied without a restart
+  assert.equal((await ok('GET', '/api/meta')).zerion, 'live');
+  const text = fs.readFileSync(envFile, 'utf8');
+  assert.ok(text.includes('ZERION_API_KEY=zk_test_1234abcd'));
+  assert.ok(text.startsWith('# test env\n') && text.includes('ZERION_MOCK=1'));   // rest of .env untouched
+  st = await ok('GET', '/api/settings');
+  assert.ok(!JSON.stringify(st).includes('zk_test_1234abcd'));           // never sent back
+  assert.equal(st.sources.find((s) => s.id === 'zerion').masked, '••••abcd');
+  await ok('DELETE', '/api/settings/zerion');
+  assert.ok(fs.readFileSync(envFile, 'utf8').includes('ZERION_API_KEY=\n'));
+  assert.equal((await ok('GET', '/api/meta')).zerion, 'mock');           // back to the .env's demo setting
+});
+
+test('Data sources: changing keys from another computer is refused without APP_PASSWORD', async () => {
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: PORT, path: '/api/settings/zerion', method: 'PUT',
+      headers: { host: 'tracker.example.com', 'content-type': 'application/json' } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject);
+    req.end(JSON.stringify({ key: 'zk_test_12345678', test: false }));
+  });
+  assert.equal(status, 403);
+  assert.ok(!fs.readFileSync(path.join(dir, '.env'), 'utf8').includes('zk_test_12345678'));
 });
