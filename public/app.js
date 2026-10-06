@@ -87,6 +87,8 @@ let matrixCols = 'venue'; // 'venue' | 'chain'
 let allocBy = 'byChain';
 async function loadMeta() {
   meta = await api('GET', '/api/meta');
+  // Every DEX the server knows becomes a sync source on the wallets it's linked to.
+  for (const d of meta.dexes || []) if (d.available) SOURCES[d.id] ??= { label: d.label, kinds: d.kinds, exchange: true, where: d.what };
   if (meta.portfolio && meta.portfolio.id !== currentPortfolio) setPortfolioId(meta.portfolio.id);
   renderPortfolioSwitch();
 }
@@ -790,33 +792,25 @@ async function openDrawer(id) {
 }
 
 // ---------- wallets ----------
+// exchange: a DEX account, linked to one wallet with "Add DEX account" (opt-in), rather than a source for the whole portfolio.
 const SOURCES = {
-  debank: { label: 'DeBank', env: 'DEBANK_ACCESS_KEY', mockEnv: 'DEBANK_MOCK', kinds: ['evm'], where: 'EVM DeFi positions.' },
-  zerion: { label: 'Zerion', env: 'ZERION_API_KEY', mockEnv: 'ZERION_MOCK', kinds: ['evm', 'solana'], where: 'EVM DeFi positions + wallet balances, Solana balances.' },
-  lighter: { label: 'Lighter', env: null, kinds: ['evm'], where: 'Perps account + LLP / public pools, with your deposit and daily history. Public API, no key needed.' },
-  extended: { label: 'Extended', env: 'EXTENDED_API_KEY', kinds: ['evm'], where: 'Perps account equity + net deposits (read-only key from Extended → API management).' },
+  debank: { label: 'DeBank', kinds: ['evm'], where: 'EVM DeFi positions.' },
+  zerion: { label: 'Zerion', kinds: ['evm', 'solana'], where: 'EVM DeFi positions + wallet balances, Solana balances.' },
+  lighter: { label: 'Lighter', kinds: ['evm'], exchange: true, where: 'Perps account + LLP / public pools, with your deposit and daily history. Public API, no key needed.' },
+  extended: { label: 'Extended', kinds: ['evm'], exchange: true, where: 'Perps account equity + net deposits (read-only key from Extended → API management).' },
 };
+// A source's state for one wallet: portfolio sources from meta, exchanges only where this wallet has one linked.
+const sourceMode = (id, w) => (SOURCES[id]?.exchange || !SOURCES[id] ? (w.exchanges?.[id] ? 'live' : 'off') : meta[id]);
+const dexLabel = (id) => meta.dexes?.find((d) => d.id === id)?.label || SOURCES[id]?.label || id;
 const sourceOf = (key) => SOURCES[key?.split('|')[0]]?.label || 'DeBank';
 const snapCache = {};
 
 function sourcesBanner() {
-  const on = Object.entries(SOURCES).filter(([id]) => meta[id] === 'live').map(([, s]) => s.label);
-  const off = Object.entries(SOURCES).filter(([id]) => meta[id] === 'off').map(([, s]) => s.label);
-  return `<div class="banner"><span>ℹ</span><div style="flex:1"><strong>Step 1: data sources</strong> (set up once, used by every wallet): ${on.length ? `${esc(on.join(', '))} connected` : 'none connected yet'}${off.length ? ` · ${esc(off.join(', '))} not set up` : ''}.
+  const portfolioSources = Object.entries(SOURCES).filter(([, s]) => !s.exchange);
+  const on = portfolioSources.filter(([id]) => meta[id] === 'live').map(([, s]) => s.label);
+  const off = portfolioSources.filter(([id]) => meta[id] === 'off').map(([, s]) => s.label);
+  return `<div class="banner"><span>ℹ</span><div style="flex:1"><strong>Step 1: data sources</strong> for this portfolio. Portfolio trackers: ${on.length ? `${esc(on.join(', '))} connected` : 'none connected yet'}${off.length ? ` · ${esc(off.join(', '))} not set up` : ''}. DEX accounts (Lighter, Extended…) are optional: add them to a wallet with <em>Add DEX account</em>.
     <a href="#/settings">Manage data sources →</a><br><strong>Step 2: wallets</strong> (below): add each address once; then <em>Sync</em> pulls its positions from the connected sources.</div></div>`;
-}
-function sourcesBannerDetailed() {
-  const rows = Object.entries(SOURCES).map(([id, s]) => {
-    const mode = meta[id];
-    const state = mode === 'live' ? '<span class="pill open"><span class="dot"></span>Connected</span>'
-      : mode === 'mock' ? '<span class="pill warn"><span class="dot"></span>Demo data</span>'
-      : '<span class="pill"><span class="dot"></span>Not configured</span>';
-    const hint = mode === 'live' ? s.where
-      : mode === 'mock' ? `Sync returns sample positions, not your wallet. Set <code>${s.env}</code> and <code>${s.mockEnv}=0</code> for real data.`
-      : `${s.where} Set <code>${s.env}</code> in <code>.env</code> and restart.`;
-    return `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><strong style="min-width:62px">${s.label}</strong>${state}<span>${hint}</span></div>`;
-  }).join('');
-  return `<div class="banner"><span>ℹ</span><div style="display:flex;flex-direction:column;gap:8px;flex:1"><div><strong>Position data sources.</strong> Each imports positions for a wallet address.${meta.autoSyncHours > 0 ? ` Connected sources re-sync automatically every ${meta.autoSyncHours}h, adding a new point to each tracked position’s history.` : ''}</div>${rows}</div></div>`;
 }
 
 async function renderWallets() {
@@ -889,10 +883,60 @@ function openWalletForm({ name = '', address = '', source = 'address', title = '
 }
 
 function syncButtons(w) {
-  const usable = Object.entries(SOURCES).filter(([id, s]) => s.kinds.includes(w.kind) && meta[id] !== 'off');
-  const main = (usable.find(([id]) => meta[id] === 'live') || usable.find(([id]) => meta[id] === 'mock'))?.[0];
+  const usable = Object.entries(SOURCES).filter(([id, s]) => s.kinds.includes(w.kind) && sourceMode(id, w) !== 'off');
+  const main = (usable.find(([id]) => sourceMode(id, w) === 'live') || usable.find(([id]) => sourceMode(id, w) === 'mock'))?.[0];
   return usable.map(([id, s]) =>
-    `<button class="btn sm ${id === main ? 'primary' : ''}" data-sync="${id}" ${meta[id] === 'off' ? `disabled title="Set ${s.env} first"` : ''}>Sync from ${s.label}${meta[id] === 'mock' ? ' (demo)' : ''}</button>`).join('');
+    `<button class="btn sm ${id === main ? 'primary' : ''}" data-sync="${id}">Sync from ${s.label}${sourceMode(id, w) === 'mock' ? ' (demo)' : ''}</button>`).join('');
+}
+
+// DEX accounts linked to this wallet, and a way to add one.
+function exchangeTags(w) {
+  if (!(meta.dexes || []).some((d) => d.kinds.includes(w.kind))) return '';
+  const linked = Object.entries(w.exchanges || {}).map(([id, x]) => `<span class="tag accent" title="${x.auth === 'key' ? 'DEX account with its own read-only key (last 4 characters shown)' : 'DEX account found from this wallet’s address'}">${esc(dexLabel(id))}${x.masked ? ` ${esc(x.masked)}` : ''}</span>`).join(' ');
+  return `<p>${linked}${linked ? ' ' : ''}<button class="btn sm" data-add-dex>+ Add DEX account</button></p>`;
+}
+
+// Add a DEX account to a wallet. wallet: preset, or chosen from `wallets`.
+function openDexForm({ wallet = null, wallets = [] } = {}, onDone) {
+  const all = (meta.dexes || []).filter((d) => (wallet ? [wallet] : wallets).some((w) => d.kinds.includes(w.kind)));
+  const choices = all.filter((d) => d.available);
+  const unavailable = all.filter((d) => !d.available);
+  if (!choices.length) { toast('Add an EVM wallet first: DEX accounts are linked to a wallet.', true); return; }
+  const walletsFor = (d) => (wallet ? [wallet] : wallets).filter((w) => d.kinds.includes(w.kind) && !w.exchanges?.[d.id]);
+  openModal(`<div class="modal-body"><h2>Add a DEX account</h2><p>The account is linked to one wallet only: other wallets and portfolios never see it.</p><div class="form">
+      <label class="full">DEX<select name="dex">${choices.map((d) => `<option value="${d.id}">${esc(d.label)}${d.auth === 'key' ? ' · API key' : ' · no key needed'}${d.beta ? ' · beta' : ''}</option>`).join('')}${unavailable.map((d) => `<option disabled>${esc(d.label)} · not available yet</option>`).join('')}</select><span class="hint" data-dex-what></span></label>
+      ${unavailable.length ? `<p class="full muted" style="margin:0;font-size:12px">${unavailable.map((d) => `<strong>${esc(d.label)}</strong>: ${esc(d.what)}.`).join(' ')}</p>` : ''}
+      ${wallet ? `<input type="hidden" name="wallet" value="${wallet.id}">` : '<label class="full">Wallet<select name="wallet"></select></label>'}
+      <label class="full" data-key-field>Read-only API key <span class="hint" data-key-help></span><input name="key" type="password" autocomplete="new-password" spellcheck="false"></label>
+      <p class="full muted" data-dex-note style="margin:0;font-size:12px"></p></div></div>
+      <div class="modal-foot"><button class="btn" data-cancel>Cancel</button><button class="btn primary" type="submit">Add account</button></div>`,
+  async (f) => {
+    const d = choices.find((x) => x.id === f.dex);
+    if (!f.wallet) throw new Error(`Every wallet here already has a ${d.label} account`);
+    const w = (wallet ? [wallet] : wallets).find((x) => x.id === Number(f.wallet));
+    const r = await api('POST', `/api/wallets/${w.id}/dex`, { dex: d.id, ...(d.auth === 'key' ? { key: f.key } : {}) });
+    toast(d.auth === 'key' ? `${d.label} account linked to ${w.name}${r.saved ? ' and saved to .env' : ''}`
+      : r.found === false ? `${d.label} added to ${w.name}, but no ${d.label} account was found at this address yet` : `${d.label} account added to ${w.name}; sync it from the wallet card`, r.found === false);
+    if (r.warning) toast(r.warning, true);
+    onDone?.();
+  });
+  const form = modal.querySelector('form');
+  const sel = form.querySelector('[name=dex]');
+  const update = () => {
+    const d = choices.find((x) => x.id === sel.value);
+    form.querySelector('[data-dex-what]').textContent = `${d.what}.${d.beta ? ' Beta: built from the official API docs but not yet checked against a real account; check the numbers against the exchange after the first sync.' : ''}`;
+    const key = d.auth === 'key';
+    form.querySelector('[data-key-field]').style.display = key ? '' : 'none';
+    form.querySelector('[name=key]').required = key;
+    form.querySelector('[data-key-help]').textContent = key ? `${d.keyHelp || `create one in ${d.label}`}. Checked with ${d.label} before saving; stored in your .env file, never shown again.` : '';
+    form.querySelector('[data-dex-note]').textContent = key ? '' : `No key needed: ${d.label} finds the account from the wallet’s address.`;
+    if (!wallet) {
+      const ws = walletsFor(d);
+      form.querySelector('select[name=wallet]').innerHTML = ws.length ? ws.map((w) => `<option value="${w.id}">${esc(w.name)}</option>`).join('') : '<option value="">(every wallet already has one)</option>';
+    }
+  };
+  sel.onchange = update;
+  update();
 }
 
 function walletCard(w) {
@@ -901,20 +945,40 @@ function walletCard(w) {
     <div class="card-head"><div><h2>${esc(w.name)} <span class="tag">${w.kind === 'evm' ? 'EVM' : w.kind === 'solana' ? 'Solana' : 'Manual'}</span>${({ metamask: 'MetaMask', phantom: 'Phantom', trustwallet: 'Trust Wallet' })[w.source] ? ` <span class="tag">${({ metamask: 'MetaMask', phantom: 'Phantom', trustwallet: 'Trust Wallet' })[w.source]}</span>` : ''}</h2>
       <div class="addr">${esc(w.address || 'No address')}</div>
       <p>${w.positions} position(s)${last}</p>
-      <p><span class="tag ${w.track_from ? 'accent' : ''}" title="Profit before this date isn’t counted for this wallet">${esc(trackFromLabel(w.track_from))}</span></p></div>
+      <p><span class="tag ${w.track_from ? 'accent' : ''}" title="Profit before this date isn’t counted for this wallet">${esc(trackFromLabel(w.track_from))}</span></p>
+      ${exchangeTags(w)}</div>
       <div class="actions">
         ${syncButtons(w)}
-        ${w.kind === 'evm' ? `<a class="btn sm" href="https://debank.com/profile/${esc(w.address)}" target="_blank" rel="noopener">DeBank ↗</a><a class="btn sm" href="https://app.zerion.io/${esc(w.address)}/overview" target="_blank" rel="noopener">Zerion ↗</a><button class="btn sm" data-bal>Native balance</button>` : ''}
-        ${w.kind === 'solana' ? `<button class="btn sm" data-bal>SOL balance</button><a class="btn sm" href="https://solscan.io/account/${esc(w.address)}" target="_blank" rel="noopener">Solscan ↗</a>` : ''}
+        ${w.kind === 'evm' ? `<a class="btn sm" href="https://debank.com/profile/${esc(w.address)}" target="_blank" rel="noopener">DeBank ↗</a><a class="btn sm" href="https://app.zerion.io/${esc(w.address)}/overview" target="_blank" rel="noopener">Zerion ↗</a><button class="btn sm" data-bal>Wallet balance</button>` : ''}
+        ${w.kind === 'solana' ? `<button class="btn sm" data-bal>Wallet balance</button><a class="btn sm" href="https://solscan.io/account/${esc(w.address)}" target="_blank" rel="noopener">Solscan ↗</a>` : ''}
         <button class="btn sm" data-rename>Edit</button><button class="btn sm danger" data-remove>Remove</button></div></div>
     <div data-balance class="ink2"></div>
     <div data-items></div></div>`;
 }
 
+// Every token in the wallet right now, from this portfolio's tracker. Without one: the native coin only.
+const TRACKER_LABEL = { zerion: 'Zerion', debank: 'DeBank', 'solana-rpc': 'Solana RPC' };
+async function walletBalanceHtml(w) {
+  const r = await api('GET', `/api/wallets/${w.id}/holdings`);
+  if (!r.source) {
+    const n = await evmNativeBalance(w.address).catch(() => null);
+    return `<div class="holdings"><p class="muted">${n ? `Native balance on ${esc(n.chain)}: <strong>${amt(n.balance)} ${esc(n.symbol)}</strong> (from your wallet extension). ` : ''}To see every token in this wallet across chains, add a Zerion or DeBank key for this portfolio on <a href="#/settings">Data sources</a>.</p></div>`;
+  }
+  const small = (h) => h.valueUsd !== null && h.valueUsd < 1;
+  const nSmall = r.holdings.filter(small).length;
+  const rows = r.holdings.map((h) => `<tr ${small(h) ? 'data-small hidden' : ''}><td><strong>${esc(h.symbol)}</strong>${h.name && h.name !== h.symbol ? `<span class="sub">${esc(h.name)}</span>` : ''}</td><td>${esc(h.chain)}</td>
+    <td class="num">${amt(h.qty)}</td><td class="num">${h.priceUsd != null ? usd(h.priceUsd) : '—'}</td><td class="num">${h.valueUsd != null ? usd(h.valueUsd) : '—'}</td></tr>`).join('');
+  return `<div class="holdings"><div class="card-head" style="margin:6px 0 8px"><h3>Wallet balance <span class="tag accent">via ${esc(TRACKER_LABEL[r.source] || r.source)}</span>${r.mock ? ' <span class="tag">demo data — not your wallet</span>' : ''}</h3>
+      <div class="actions"><strong>${usd(r.totalUsd)}</strong></div></div>
+    ${r.holdings.length ? `<div class="table-wrap"><table><thead><tr><th>Token</th><th>Chain</th><th class="num">Amount</th><th class="num">Price</th><th class="num">Value</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">No tokens in this wallet.</p>'}
+    ${nSmall ? `<button class="btn sm" data-dust>Show ${nSmall} balance(s) under $1</button>` : ''}
+    <p class="muted" style="font-size:12px">Tokens held directly in the wallet, at current prices. DeFi positions (pools, staking, lending) are listed under “Detected DeFi positions”.${r.nativeOnly ? ' Only SOL is shown: add a Zerion key for this portfolio to see every Solana token.' : ''}</p></div>`;
+}
+
 async function bindWalletCard(w) {
   const el = $(`#w${w.id}`);
   const items = $('[data-items]', el);
-  const sources = Object.keys(SOURCES).filter((id) => SOURCES[id].kinds.includes(w.kind));
+  const sources = Object.keys(SOURCES).filter((id) => SOURCES[id].kinds.includes(w.kind) && (!SOURCES[id].exchange || w.exchanges?.[id]));
   const showItems = (data) => {
     if (!data) { items.innerHTML = ''; return; }
     const label = SOURCES[data.provider]?.label || 'DeBank';
@@ -972,11 +1036,13 @@ async function bindWalletCard(w) {
       rerender();
     } finally { btn.disabled = false; btn.textContent = text; }
   })));
-  $('[data-bal]', el)?.addEventListener('click', guard(async () => {
+  $('[data-bal]', el)?.addEventListener('click', guard(async (e) => {
     const out = $('[data-balance]', el);
-    out.textContent = 'Loading…';
-    if (w.kind === 'solana') { const r = await api('GET', `/api/wallets/${w.id}/balance`); out.textContent = `Balance: ${amt(r.balance)} SOL`; }
-    else { const r = await evmNativeBalance(w.address); out.textContent = `Balance on ${r.chain}: ${amt(r.balance)} ${r.symbol} (via your wallet extension)`; }
+    if (out.dataset.open) { out.innerHTML = ''; delete out.dataset.open; e.target.textContent = 'Wallet balance'; return; }
+    out.innerHTML = '<p class="muted">Loading wallet balance…</p>';
+    try { out.innerHTML = await walletBalanceHtml(w); out.dataset.open = '1'; e.target.textContent = 'Hide wallet balance'; }
+    catch (err) { out.innerHTML = ''; throw err; }
+    $('[data-dust]', out)?.addEventListener('click', (ev) => { $$('tr[data-small]', out).forEach((tr) => (tr.hidden = !tr.hidden)); ev.target.remove(); });
   }));
   $('[data-rename]', el).onclick = () => {
     openModal(`<div class="modal-body"><h2>Edit wallet</h2><p>Changing the start date applies to positions you track from now on and to fee/deposit suggestions. Positions already tracked keep their deposit and entry date; edit those one by one if needed.</p><div class="form">
@@ -986,7 +1052,8 @@ async function bindWalletCard(w) {
     async (f) => { Object.keys(snapCache).forEach((k) => delete snapCache[k]); await api('PUT', `/api/wallets/${w.id}`, { name: f.name, ...(w.address ? { track_from: trackFromValue(f) } : {}) }); rerender(); });
     bindTrackFrom(modal.querySelector('form'));
   };
-  $('[data-remove]', el).onclick = () => confirmModal('Remove wallet?', `Positions assigned to “${w.name}” are kept and become unassigned.`, 'Remove', async () => { await api('DELETE', `/api/wallets/${w.id}`); rerender(); });
+  $('[data-remove]', el).onclick = () => confirmModal('Remove wallet?', `Positions assigned to “${w.name}” are kept and become unassigned.${Object.keys(w.exchanges || {}).length ? ' Its DEX account keys are deleted from .env.' : ''}`, 'Remove', async () => { await api('DELETE', `/api/wallets/${w.id}`); rerender(); });
+  $('[data-add-dex]', el)?.addEventListener('click', () => openDexForm({ wallet: w }, rerender));
 }
 
 // ---------- prices ----------
@@ -1022,68 +1089,149 @@ async function renderPrices() {
 }
 
 // ---------- data sources (API keys) ----------
-async function renderSettings() {
-  const st = await api('GET', '/api/settings');
-  const pill = (mode) => (mode === 'live' ? '<span class="pill open"><span class="dot"></span>Connected</span>'
-    : mode === 'mock' ? '<span class="pill warn"><span class="dot"></span>Demo data</span>' : '<span class="pill"><span class="dot"></span>Not set up</span>');
-  view.innerHTML = `<div class="page-head"><div><div class="eyebrow">Setup</div><h1>Data sources</h1>
-      <p>Data sources read what’s inside your wallets. Set them up once here; every wallet in every portfolio then syncs from them. Wallets themselves are added on the <a href="#/wallets">Wallets</a> page.</p></div></div>
-    ${st.envFile.writable ? '' : `<div class="banner"><span>⚠</span><div><strong>Keys can’t be saved to .env:</strong> ${esc(st.envFile.reason || '')}. Keys you enter still work until the app restarts. To make them permanent, run <code>cp .env.example .env</code> in the app folder, then <code>docker compose up -d</code>, and enter them again.</div></div>`}
-    <section class="stack">
-      <div class="card"><div class="card-head"><div><h2>Lighter ${pill(st.lighter)}</h2><p>Perps account, LLP / public pools and LIT staking, with deposits and daily history. Public API: no key needed.</p></div></div></div>
-      ${st.sources.map((s) => `<div class="card" data-src="${s.id}"><div class="card-head"><div><h2>${esc(s.label)} ${pill(s.mode)}</h2><p>${esc(s.what)}</p></div>
-          ${s.configured ? `<div class="actions"><span class="tag" title="Only the last 4 characters are shown">${esc(s.masked)}</span><button class="btn sm" data-test>Test connection</button><button class="btn sm danger" data-remove>Remove key</button></div>` : ''}</div>
-        <form class="form" data-key-form autocomplete="off">
-          <label class="full">${s.configured ? 'Replace key' : 'API key'} <span class="hint">get one at <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url.replace('https://', ''))}</a>. It’s checked with ${esc(s.label)} before saving, and stored in your .env file as ${esc(s.env)}.</span>
-            <div style="display:flex;gap:8px"><input name="key" type="password" placeholder="Paste your ${esc(s.label)} key" autocomplete="new-password" spellcheck="false" style="flex:1"><button class="btn primary" type="submit">Save &amp; test</button></div></label>
-          <p class="full muted" data-result style="margin:0;font-size:12px"></p>
-        </form></div>`).join('')}
-    </section>
-    <p class="muted" style="font-size:12px;margin-top:14px">Keys stay on this computer, in the app’s .env file. The app never shows them again (only the last 4 characters) and changing them is only allowed from this computer, unless APP_PASSWORD protects the app.</p>`;
+// Keys belong to the active portfolio (Zerion, DeBank) or to one of its wallets (exchange accounts).
+const keyPill = (mode) => (mode === 'live' ? '<span class="pill open"><span class="dot"></span>Connected</span>'
+  : mode === 'mock' ? '<span class="pill warn"><span class="dot"></span>Demo data</span>' : '<span class="pill"><span class="dot"></span>Not set up</span>');
 
-  for (const s of st.sources) {
-    const card = $(`[data-src="${s.id}"]`);
-    const result = $('[data-result]', card);
-    $('[data-key-form]', card).onsubmit = guard(async (e) => {
-      e.preventDefault();
-      const btn = $('button[type=submit]', card), input = $('input[name=key]', card);
-      btn.disabled = true; btn.textContent = 'Testing…'; result.textContent = '';
-      try {
-        const r = await api('PUT', `/api/settings/${s.id}`, { key: input.value });
-        input.value = '';
-        toast(`${s.label} connected${r.saved ? ' and saved to .env' : ''}`);
-        if (r.warning) toast(r.warning, true);
-        await loadMeta(); rerender();
-      } catch (err) { result.textContent = err.message; result.className = 'full neg'; }
-      finally { btn.disabled = false; btn.textContent = 'Save & test'; }
-    });
-    $('[data-test]', card)?.addEventListener('click', guard(async (e) => {
-      e.target.disabled = true; e.target.textContent = 'Testing…';
-      try { const r = await api('POST', `/api/settings/${s.id}/test`); toast(r.ok ? `${s.label}: ${r.message}` : `${s.label}: ${r.message}`, !r.ok); }
-      finally { e.target.disabled = false; e.target.textContent = 'Test connection'; }
-    }));
-    $('[data-remove]', card)?.addEventListener('click', () => confirmModal(`Remove the ${s.label} key?`, `${s.label} stops syncing until you add a key again. Positions already tracked are kept.`, 'Remove key',
-      async () => { await api('DELETE', `/api/settings/${s.id}`); toast(`${s.label} key removed`); await loadMeta(); rerender(); }));
+// One key form: save & test, test, remove. `q` adds ?wallet= for exchange accounts.
+function bindKeyCard(card, { id, label, q = '', configured }) {
+  const result = $('[data-result]', card);
+  $('[data-key-form]', card).onsubmit = guard(async (e) => {
+    e.preventDefault();
+    const btn = $('button[type=submit]', card), input = $('input[name=key]', card);
+    btn.disabled = true; btn.textContent = 'Testing…'; result.textContent = '';
+    try {
+      const r = await api('PUT', `/api/settings/${id}${q}`, { key: input.value });
+      input.value = '';
+      toast(`${label} connected${r.saved ? ' and saved to .env' : ''}`);
+      if (r.warning) toast(r.warning, true);
+      await loadMeta(); rerender();
+    } catch (err) { result.textContent = err.message; result.className = 'full neg'; }
+    finally { btn.disabled = false; btn.textContent = 'Save & test'; }
+  });
+  if (!configured) return;
+  bindKeyTest(card, id, label, q);
+  $('[data-remove]', card).addEventListener('click', () => confirmModal(`Remove the ${label} key?`, `${label} stops syncing here until you add a key again. Positions already tracked are kept.`, 'Remove key',
+    async () => { await api('DELETE', `/api/settings/${id}${q}`); toast(`${label} key removed`); await loadMeta(); rerender(); }));
+}
+
+function bindKeyTest(card, id, label, q = '') {
+  $('[data-test]', card).addEventListener('click', guard(async (e) => {
+    e.target.disabled = true; e.target.textContent = 'Testing…';
+    try { const r = await api('POST', `/api/settings/${id}/test${q}`); toast(`${label}: ${r.message}`, !r.ok); }
+    finally { e.target.disabled = false; e.target.textContent = 'Test connection'; }
+  }));
+}
+
+const keyActions = (k) => (k.configured ? `<div class="actions"><span class="tag" title="Only the last 4 characters are shown">${esc(k.masked)}</span><button class="btn sm" data-test>Test connection</button><button class="btn sm danger" data-remove>Remove key</button></div>` : '');
+const legacyNote = (k, wallet) => (k.from === 'legacy' ? `<p class="muted" style="font-size:12px;margin:4px 0 0">This key comes from the older <code>${esc(k.legacyEnv)}</code> line in .env, which ${wallet ? 'is linked to this wallet only' : 'only applies to your first portfolio'}. Saving a key here replaces it.</p>` : '');
+const keyForm = (label, url, hint, configured) => `<form class="form" data-key-form autocomplete="off">
+    <label class="full">${configured ? 'Replace key' : 'API key'} <span class="hint">get one at <a href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace('https://', ''))}</a>. ${hint}</span>
+      <div style="display:flex;gap:8px"><input name="key" type="password" placeholder="Paste your ${esc(label)} key" autocomplete="new-password" spellcheck="false" style="flex:1"><button class="btn primary" type="submit">Save &amp; test</button></div></label>
+    <p class="full muted" data-result style="margin:0;font-size:12px"></p></form>`;
+
+const sectionHead = (title, text) => `<div class="section-head"><h2>${title}</h2><p>${text}</p></div>`;
+
+async function renderSettings() {
+  await loadMeta();
+  const st = await api('GET', '/api/settings');
+  const pname = esc(st.portfolio?.name || '');
+  const linked = st.wallets.flatMap((w) => Object.entries(w.exchanges).map(([id, x]) => ({ w, id, x })));
+  const evmWallets = st.wallets.filter((w) => w.kind === 'evm');
+  const dex = Object.fromEntries(st.dexes.map((d) => [d.id, d]));
+  view.innerHTML = `<div class="page-head"><div><div class="eyebrow">Portfolio setup</div><h1>Data sources for “${pname}”</h1>
+      <p>Everything here belongs to <strong>this portfolio only</strong>; switch portfolio at the top to set up another. Wallets are added on the <a href="#/wallets">Wallets</a> page.</p></div></div>
+    ${st.envFile.writable ? '' : `<div class="banner"><span>⚠</span><div><strong>Keys can’t be saved to .env:</strong> ${esc(st.envFile.reason || '')}. Keys you enter still work until the app restarts. To make them permanent, run <code>cp .env.example .env</code> in the app folder, then <code>docker compose up -d</code>, and enter them again.</div></div>`}
+
+    ${sectionHead('Portfolio trackers', `On-chain data aggregators: they read everything a wallet holds across chains (DeFi positions and token balances) from its address. One key each, used by every wallet in “${pname}”.`)}
+    <section class="stack">
+      ${st.sources.map((s) => `<div class="card" data-src="${s.id}"><div class="card-head"><div><h2>${esc(s.label)} ${keyPill(s.mode)}</h2><p>${esc(s.what)}.</p>${legacyNote(s)}</div>${keyActions(s)}</div>
+        ${keyForm(s.label, s.url, `It’s checked with ${esc(s.label)} before saving and stored in your .env file for this portfolio.`, s.configured)}</div>`).join('')}
+    </section>
+
+    ${sectionHead('DEX accounts', 'Your accounts on decentralized exchanges: trading positions, liquidity pools and staking, with deposits so profit is exact. Optional: nothing is set up until you add an account, and each account belongs to one wallet.')}
+    <div class="actions" style="margin:-4px 0 12px">${evmWallets.length ? '<button class="btn primary" data-add-dex>+ Add DEX account</button>' : '<span class="muted">Add a wallet first: DEX accounts are linked to a wallet.</span>'}
+      <span class="muted" style="font-size:12px">Available: ${esc(st.dexes.filter((d) => d.available).map((d) => d.label + (d.beta ? ' (beta)' : '')).join(', '))}${st.dexes.some((d) => !d.available) ? ` · not available yet: ${esc(st.dexes.filter((d) => !d.available).map((d) => d.label).join(', '))}` : ''}</span></div>
+    <section class="stack">
+      ${linked.length ? linked.map(({ w, id, x }) => { const d = dex[id] || { label: id }; const a = x.account;
+        const status = !a?.synced ? '<span class="muted">not synced yet: use <em>Sync</em> on the wallet card</span>'
+          : a.found ? `<span class="muted">${usd(a.totalUsd)} · last sync ${esc(a.fetchedAt)} UTC</span>` : '<span class="muted">no account found at this address in the last sync</span>';
+        return `<div class="card" data-ex="${id}:${w.id}"><div class="card-head"><div><h2>${esc(d.label)} · ${esc(w.name)} ${keyPill('live')}${d.beta ? ' <span class="tag">beta</span>' : ''}</h2><p>${esc(d.what || '')}. ${d.auth === 'key' ? 'Read-only API key.' : 'No key: found from the wallet’s address.'}</p><p>${status}</p>${x.from === 'legacy' ? legacyNote({ from: 'legacy', legacyEnv: `${id.toUpperCase()}_API_KEY` }, true) : ''}</div>
+          <div class="actions">${d.auth === 'key' ? `<span class="tag" title="Only the last 4 characters are shown">${esc(x.masked)}</span><button class="btn sm" data-test>Test connection</button>` : ''}<button class="btn sm danger" data-unlink>Remove account</button></div></div>
+          ${d.auth === 'key' ? keyForm(d.label, d.url || '', `Linked to ${esc(w.name)} only.`, true) : ''}</div>`; }).join('')
+        : '<div class="card"><p class="muted" style="margin:0">No DEX accounts in this portfolio yet.</p></div>'}
+    </section>
+    <p class="muted" style="font-size:12px;margin-top:14px">Keys stay on this computer, in the app’s .env file, one line per portfolio or wallet. The app never shows them again (only the last 4 characters) and changing them is only allowed from this computer, unless APP_PASSWORD protects the app.</p>`;
+
+  for (const s of st.sources) bindKeyCard($(`[data-src="${s.id}"]`), { id: s.id, label: s.label, configured: s.configured });
+  for (const { w, id } of linked) {
+    const card = $(`[data-ex="${id}:${w.id}"]`);
+    const label = `${dex[id]?.label || id} (${w.name})`;
+    if (dex[id]?.auth === 'key') bindKeyCard(card, { id, label, q: `?wallet=${w.id}`, configured: false }), bindKeyTest(card, id, label, `?wallet=${w.id}`);
+    $('[data-unlink]', card).addEventListener('click', () => confirmModal(`Remove the ${label} account?`, `It stops syncing${dex[id]?.auth === 'key' ? ' and its key is deleted from .env' : ''}. Positions already tracked from it are kept.`, 'Remove account',
+      async () => { await api('DELETE', `/api/wallets/${w.id}/dex/${id}`); toast(`${label} removed`); await loadMeta(); rerender(); }));
   }
+  $('[data-add-dex]')?.addEventListener('click', () => openDexForm({ wallets: st.wallets }, async () => { await loadMeta(); rerender(); }));
 }
 
 // ---------- guide ----------
 function renderGuide() {
-  view.innerHTML = `<div class="guide"><div class="page-head"><div><h1>Guide</h1><p>How the app maps to the BitBlock Excel tracker.</p></div></div>
+  view.innerHTML = `<div class="guide"><div class="page-head"><div><h1>Guide</h1><p>How to set the app up and where its numbers come from.</p></div></div>
   <div class="card">
-  <h2 style="margin-top:0">The basics</h2>
+  <h2 style="margin-top:0">Getting started in four steps</h2>
+  <ol>
+    <li><strong>Pick a portfolio</strong> (sidebar switcher). Everything below is set up per portfolio.</li>
+    <li><strong>Data sources</strong>: add a portfolio tracker key (Zerion or DeBank) on the <a href="#/settings">Data sources</a> page.</li>
+    <li><strong>Wallets</strong>: add each wallet address on the <a href="#/wallets">Wallets</a> page, and add a DEX account to it for every exchange you’ve deposited funds into.</li>
+    <li><strong>Sync, then Track</strong>: sync a wallet, then <em>Track</em> (or <em>Track all</em>) the positions you want to follow. From then on every sync, and the automatic one every 12 hours, adds a new value to each tracked position.</li>
+  </ol>
+
+  <h2>Portfolios</h2>
+  <p>Use the <em>Portfolio</em> switcher in the sidebar to create, name and switch portfolios. Each one is fully separate: its own wallets, positions, totals, suggestions, <strong>and its own API keys</strong>. Nothing set up in one portfolio is ever used by another. <em>Sync all</em> only syncs the active portfolio. A portfolio can mix wallet types (MetaMask, Phantom, Trust Wallet, watched addresses). Market prices are the only thing shared.</p>
+
+  <h2>Data sources: two kinds</h2>
+  <p>The <a href="#/settings">Data sources</a> page has two sections, because there are two places your money can be.</p>
   <ul>
-    <li><strong>One position per wallet and deposit.</strong> For an additional deposit, add another position (no time-weighted cash flows, same as the sheet).</li>
-    <li><strong>Record everything in the position’s currency</strong> — deposit, values, withdrawals, rewards and fees (e.g. all in USDC, or all in ETH).</li>
-    <li><strong>Update value</strong> whenever you check the platform. Each update becomes a point on the charts — this is what builds your performance history.</li>
+    <li><strong>Portfolio trackers (Zerion, DeBank)</strong> read the blockchain. Give them a wallet address and they return what it holds across many chains: tokens, and on-chain DeFi positions such as liquidity pools, lending and staking. One key per portfolio is enough. It doesn’t point to a wallet: it’s your permission to use the service, and the app asks it about each wallet address in the portfolio when it syncs.</li>
+    <li><strong>DEX accounts (Lighter, Extended, Hyperliquid, GMX, GRVT, Bulk)</strong> read your account <em>inside</em> an exchange. Once you deposit into an exchange, your balance, positions and P/L live in the exchange’s own system. A portfolio tracker sees the money leave your wallet, but not what happens to it after. Each DEX account belongs to one wallet and is optional: nothing is set up until you add it. Some need only the wallet’s address; others need a read-only API key. Beta means built from the exchange’s official docs but not yet checked against a real account. Variational can’t be connected yet: it has no API for reading accounts.</li>
   </ul>
-  <h2>Formulas (same as the spreadsheet)</h2>
+  <div class="table-wrap"><table><thead><tr><th>Where the money is</th><th>What reads it</th></tr></thead><tbody>
+    <tr><td>Tokens in your wallet</td><td>Portfolio tracker (Zerion / DeBank)</td></tr>
+    <tr><td>On-chain DeFi: pools, lending, staking, vaults</td><td>Portfolio tracker (Zerion / DeBank)</td></tr>
+    <tr><td>Deposited into an exchange (perps, exchange pools, exchange staking)</td><td>That exchange’s DEX account</td></tr>
+  </tbody></table></div>
+  <p><strong>Do I need both?</strong> Only a portfolio tracker, if you only hold tokens and use on-chain DeFi. Add one DEX account for each exchange you’ve deposited into: without it, that money is invisible to the app. GMX runs on-chain, so Zerion may also list a GMX position. If both show the same position, track it from one source only.</p>
+
+  <h2>Zerion or DeBank?</h2>
+  <ul><li><strong>Zerion</strong>: EVM chains plus Solana token balances (it doesn’t index Solana DeFi positions yet). Needed for fee and deposit suggestions. Key from dashboard.zerion.io.</li>
+  <li><strong>DeBank</strong>: EVM chains, very broad protocol coverage. Paid API (AccessKey from cloud.debank.com).</li></ul>
+  <h2>Wallets</h2>
   <ul>
-    <li><strong>Current value</strong> = last recorded value − withdrawals made after it. You no longer need the Inputs sheet’s “withdrawals already reflected” column: the app knows from the dates.</li>
-    <li><strong>Profit / loss</strong> = current (or exit) value + all withdrawals + separate rewards − additional fees − deposit. A withdrawal alone never changes profit.</li>
-    <li><strong>Total return</strong> = P/L ÷ deposit. <strong>Annualized (simple)</strong> = total return × 365 ÷ days. Not APY or XIRR.</li>
-    <li><strong>Duration</strong> = exit date (or latest valuation date) − entry date.</li>
-    <li><strong>USD</strong> = native P/L × current USD price from the Prices page. Charts use today’s prices for past dates too, so they show performance in coin terms converted at today’s rate — not historical USD P/L.</li>
+    <li><strong>Adding a wallet:</strong> connect MetaMask, Phantom or Trust Wallet (read-only: the app only asks for your public address, never a signature), or paste any address. Browser extensions need Chrome, Brave or Firefox; in Safari, paste the address instead.</li>
+    <li><strong>Wallet balance</strong> lists every token sitting directly in the wallet, across chains, with amount, price and value (needs a portfolio tracker key). DeFi positions are listed separately under “Detected DeFi positions”, so nothing is counted twice.</li>
+    <li><strong>+ Add DEX account</strong> on a wallet links an exchange account to it. The wallet then gets a <em>Sync from …</em> button for that exchange.</li>
+    <li><strong>Track</strong> turns something a source found into a position. It’s re-valued on every later sync from that same source.</li>
+  </ul>
+
+  <h2>Exchange accounts and their P/L</h2>
+  <p>An exchange account’s profit = account value − net money moved in (deposits − withdrawals ± transfers). It’s shown in parts that add up: each open position’s unrealised P/L, then trades, fees and funding by day. Anything the exchange doesn’t itemise is shown as “Other” rather than hidden. Hyperliquid only keeps your latest 10,000 trades; for busier accounts, older P/L appears as one dated “Earlier trades” line. When a long on one venue hedges a short on another, the two legs are compared with each other, never with a whole account.</p>
+
+  <h2>API keys and privacy</h2>
+  <p>Keys are entered in the app, tested with the provider first (a wrong key is never saved), and stored only in the app’s <code>.env</code> file on this computer, one line per portfolio or wallet. The app never shows a key again, only its last 4 characters, and keys can only be changed from this computer unless the app is password-protected. Use read-only keys. Removing a wallet or portfolio deletes its keys.</p>
+
+  <h2>Positions and manual entries</h2>
+  <ul>
+    <li><strong>Synced positions</strong> (tracked from a data source) update themselves on every sync. You don’t need to enter values for them.</li>
+    <li><strong>Manual positions</strong> are for anything no source can read. Record everything in the position’s currency (all in USDC, or all in ETH), and use <em>Update value</em> whenever you check the platform. Each value becomes a point on the charts.</li>
+    <li><strong>Money added later</strong> to a position is recorded as <em>capital in</em>: it raises the amount invested, never the profit.</li>
+  </ul>
+  <h2>How profit is calculated</h2>
+  <ul>
+    <li><strong>Profit / loss</strong> = current (or exit) value + withdrawals + rewards − fees − money invested (deposit + capital added). A withdrawal alone never changes profit.</li>
+    <li><strong>Current value</strong> = the latest value, minus withdrawals and plus capital added after it.</li>
+    <li><strong>Total return</strong> = P/L ÷ money invested. <strong>Annualized</strong> = total return × 365 ÷ days held (a simple rate: not APY or XIRR).</li>
+    <li><strong>Duration</strong> = exit date (or latest value date) − entry date.</li>
+    <li><strong>USD</strong>: positions held in a token are converted at its current price from the Prices page. Charts also use today’s price for past dates, so they show performance in token terms at today’s rate.</li>
   </ul>
   <h2>Pool fees</h2>
   <ul>
@@ -1091,26 +1239,17 @@ function renderGuide() {
     <li><strong>Collected fees</strong> leave the pool and land in your wallet. They count as rewards: profit = value + withdrawals + rewards − fees − deposit.</li>
     <li>With Zerion connected, each sync scans your transactions and suggests collected fees and deposits for your tracked pools. Confirm them on the Dashboard, the Positions page, or inside a position. Anything it can’t match confidently (e.g. a token that’s in several pools) is skipped; add those with <em>Reward</em> yourself.</li>
   </ul>
-  <h2>Setting up: data sources, then wallets</h2>
-  <p><strong>1. Data sources</strong> (sidebar → <em>Data sources</em>): paste your Zerion, DeBank or Extended API key once; it’s tested and saved to the app’s .env file. Lighter needs no key. <strong>2. Wallets</strong>: add each address (connect MetaMask/Phantom/Trust Wallet, or paste it). <em>Sync</em> then pulls each wallet’s positions from every connected source.</p>
-  <h2>Portfolios</h2>
-  <p>Use the <em>Portfolio</em> switcher in the sidebar to create, name and switch portfolios. Each has its own wallets, positions, totals and suggestions, and <em>Sync all</em> only syncs the active one. A portfolio can mix wallet types (MetaMask, Phantom, Trust Wallet, watched addresses). Market prices are shared by all portfolios.</p>
   <h2>Rewards and corrections</h2>
   <p><em>Rewards</em> offers two clearly labelled choices: <strong>Update total rewards to date</strong> (replaces the total: 112 → 120 shows 120) or <strong>Add one reward payment</strong> (adds to it). Fees stay separate. To fix a wrong entry (e.g. 977 instead of 77), use ✎ in Activity. The correction applies everywhere, and the old value is kept in <em>Correction history</em> with a Restore button.</p>
   <h2>Your target</h2>
   <p>“Your target” is the optional <em>Target annual return</em> you enter on a position (a simple APR). The app never fills it in. “vs. target” is the simple annualized return minus your target, shown once a position has 30+ days. Annualizing a few days of P/L would exaggerate it.</p>
-  <h2>Closing a position and moving money to the wallet</h2>
+  <h2>Closing positions</h2>
+  <p><em>Close position</em> asks for the exit date and final proceeds; earlier partial withdrawals remain. <em>Reopen</em> clears the exit date; add a fresh value afterwards.</p>
   <p>Money moving between your positions is never profit. When a synced pool disappears and your transactions show its tokens coming back, the app closes the pool at the amount you withdrew; without that evidence it asks you on the Dashboard (“Position closed?”). A wallet’s profit is only the price change of tokens it already held. Tokens arriving or leaving (a closed pool paying out, a transfer from an exchange, gas) are recorded as <em>capital in</em> / <em>withdrawal</em>, so the same dollars are never counted twice.</p>
   <h2>Start tracking from</h2>
   <p>Each wallet has a start date, chosen when you add or connect it (default: today). Profit made before that date is never counted. Exchange trades closed earlier and money moved earlier are ignored, positions start from their value on that date, and only later fee collections are suggested. Change it with <em>Edit</em> on the wallet. Positions you already track keep their own deposit and entry date.</p>
   <h2>Status</h2>
   <p><strong>Complete inputs</strong> (strategy, chain, currency, entry date, deposit missing) · <strong>Enter position value</strong> · <strong>Check withdrawals</strong> (value would go negative) · <strong>Check dates</strong> (valuation or exit before entry) · <strong>Open</strong> · <strong>Closed</strong>. Only Open and Closed positions count in results.</p>
-  <h2>Closing & reopening</h2>
-  <p>“Close position” asks for the exit date and final proceeds. Earlier partial withdrawals remain. “Reopen” clears the exit date; add a fresh value afterwards.</p>
-  <h2>Wallets, DeBank & Zerion</h2>
-  <p>MetaMask and Phantom connect read-only to give the app your public address. A data source then lists the DeFi positions it sees for that address; “Track” turns one into a position that is re-valued on every sync from that same source.</p>
-  <ul><li><strong>DeBank</strong> — EVM chains, very broad protocol coverage. Paid API (AccessKey from cloud.debank.com).</li>
-  <li><strong>Zerion</strong> — EVM chains plus Solana token balances (Zerion does not index Solana protocol positions yet). API key from dashboard.zerion.io.</li></ul>
   <h2>Backup</h2>
   <p>Data lives in a SQLite file in the <code>data/</code> volume. <a href="/api/export">Download a JSON backup</a> · <a href="/api/export.csv">Export positions as CSV</a> (columns match the Strategies sheet) · <label style="display:inline"><a href="#" id="importLink">Restore from backup…</a><input type="file" id="importFile" accept=".json" class="hidden"></label></p>
   </div></div>`;

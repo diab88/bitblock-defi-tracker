@@ -1,7 +1,7 @@
 // Zerion returns one row per token; the app must merge rows of one protocol position and net out debt.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeZerion } from '../server/integrations.js';
+import { normalizeZerion, normalizeZerionHoldings, normalizeDebankHoldings } from '../server/integrations.js';
 
 const row = (id, chain, type, symbol, value, extra = {}) => ({
   type: 'positions', id,
@@ -45,4 +45,16 @@ test('Uniswap V3 NFT pools are V3 Pool; known chains get display names', () => {
   assert.equal(i.chain, 'Unichain');
   const aero = { protocol: 'Aerodrome', protocol_module: 'liquidity_pool', group_id: 's1', name: 'Aerodrome AERO/USDC Pool', application_metadata: { name: 'Aerodrome' } };
   assert.equal(normalizeZerion([row('c', 'base', 'deposit', 'USDC', 60, aero), row('d', 'base', 'deposit', 'AERO', 55, aero)])[0].strategy, 'V2 Pool');
+});
+
+test('wallet balance lists each token held directly, largest first; DeFi positions and trash are left out', () => {
+  const h = normalizeZerionHoldings([
+    row('w1', 'base', 'wallet', 'USDC', 840, { quantity: { float: 840 }, price: 1 }),
+    row('w2', 'ethereum', 'wallet', 'ETH', 4000, { quantity: { float: 1.25 }, price: 3200 }),
+    row('d1', 'base', 'deposit', 'cbETH', 6400, aave),
+    row('t1', 'base', 'wallet', 'SCAM', 99, { quantity: { float: 1e6 }, flags: { is_trash: true } }),
+  ]);
+  assert.deepEqual(h.map((x) => [x.symbol, x.chain, x.qty, x.valueUsd]), [['ETH', 'Ethereum', 1.25, 4000], ['USDC', 'Base', 840, 840]]);
+  const d = normalizeDebankHoldings([{ symbol: 'ARB', chain: 'arb', amount: 300, price: 0.4, is_wallet: true }, { symbol: 'X', chain: 'eth', amount: 0, price: 1 }]);
+  assert.deepEqual(d.map((x) => [x.symbol, x.chain, x.valueUsd]), [['ARB', 'Arbitrum', 120]]);
 });

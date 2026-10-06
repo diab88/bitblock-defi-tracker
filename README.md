@@ -37,14 +37,30 @@ All read-only: the app asks only for a public address and never requests a signa
 - **MetaMask**: connects via the injected EIP-1193 / EIP-6963 provider; shows native balance on the current chain.
 - **Phantom**: Solana address (SOL balance via Solana RPC) and Phantom's EVM address.
 - **Watch any address**: paste an EVM or Solana address, no extension needed.
-Data sources import positions by wallet address. Enable them in `.env`:
+Data sources are set up per portfolio in the app (sidebar → **Data sources**), in two groups.
 
-| Source | Covers | Deposit known? | Key |
+**Portfolio trackers:** on-chain aggregators that read a wallet's DeFi positions and token balances by address. One key per portfolio.
+
+| Tracker | Covers | Deposit known? |
+|---|---|---|
+| **Zerion** | EVM DeFi positions + wallet balances; Solana balances | No, deposit starts at today's value |
+| **DeBank** | EVM DeFi positions (paid API) | No |
+
+**DEX accounts:** opt-in. Nothing exists until you use **+ Add DEX account**, and each account belongs to one wallet.
+
+| DEX | Read access | Covers | Status |
 |---|---|---|---|
-| **Zerion** | EVM DeFi positions + wallet balances; Solana balances | No, deposit starts at today's value | `ZERION_API_KEY` (dashboard.zerion.io) |
-| **DeBank** | EVM DeFi positions | No | `DEBANK_ACCESS_KEY` (cloud.debank.com, paid) |
-| **Lighter** | Perps account, LLP / public pools, LIT staking | **Yes**: principal, entry date, daily history (LLP) | none, public API |
-| **Extended** | Perps account equity | **Yes**: net deposits from asset operations | `EXTENDED_API_KEY`, read-only key from Extended → API management |
+| **Lighter** | wallet address | perps account, LLP / public pools, LIT staking, daily history | live |
+| **Extended** | read-only API key | perps account, net deposits, P/L breakdown | live |
+| **Hyperliquid** | wallet address | perps + spot + staked HYPE, vault deposits (HLP), net deposits, trades & funding | live |
+| **GMX v2** | wallet address | open perps on Arbitrum / Avalanche, each with its collateral | live |
+| **GRVT** | Trading API key (session login) | equity, positions, transfers into the trading account, fills | beta: not yet checked on a real account |
+| **Bulk** | Solana address | perps account, deposits, closed trades | beta: not yet checked on a real account |
+| **Variational** | — | no per-user API yet (their trading API is still in development) | not available |
+
+Exchange accounts report P/L as parts that add up: unrealised P/L per open position, trades / fees / funding by
+day, and anything the exchange doesn't itemise as "Other". Hyperliquid only serves the latest 10,000 fills; for
+accounts with more, older P/L is one dated "Earlier trades" entry.
 
 *Track* / *Track all* turns synced items into positions. Every later sync from **the same source** adds a valuation,
 and `AUTO_SYNC_HOURS` (default 12) does that in the background, so each position builds a value history.
@@ -62,7 +78,7 @@ This is a single-user app. A multi-tenant SaaS would need real user accounts and
 ## API
 
 `GET /api/dashboard?wallet=&currency=&status=` · `GET/POST /api/positions` · `PUT/DELETE /api/positions/:id` ·
-`POST /api/positions/:id/events|close|reopen` · `GET/POST /api/wallets` · `POST /api/wallets/:id/sync?provider=debank|zerion` · `GET /api/wallets/:id/snapshot` ·
+`POST /api/positions/:id/events|close|reopen` · `GET/POST /api/wallets` · `POST /api/wallets/:id/sync?provider=debank|zerion|lighter|extended` · `GET /api/settings` · `PUT/DELETE /api/settings/:source[?wallet=id]` · `GET /api/wallets/:id/snapshot` ·
 `GET/PUT /api/prices` · `POST /api/prices/refresh` · `GET /api/export` (JSON) · `GET /api/export.csv` · `POST /api/import`
 
 ## Portfolios, rewards, corrections and targets
@@ -79,10 +95,23 @@ This is a single-user app. A multi-tenant SaaS would need real user accounts and
 
 ### API keys: the Data sources page
 
-Sidebar → **Data sources**: paste a Zerion, DeBank or Extended key. It's tested against the provider, saved to
-`.env` (which `docker-compose.yml` bind-mounts into the container), and applied immediately, with no restart.
-Keys are shown only as `••••1a2b`, and changing them is limited to this computer unless `APP_PASSWORD` is set.
-You can still edit `.env` by hand and run `docker compose up -d`.
+Keys are never shared between portfolios:
+
+- **Zerion and DeBank keys belong to a portfolio.** Sidebar → **Data sources** sets them for the active
+  portfolio; switch portfolio to set another's. A portfolio without a key doesn't sync from that source.
+- **Exchange accounts (Extended) belong to one wallet** and are opt-in: nothing exists until you use
+  *Link exchange account* on a wallet (or *+ Link exchange account* on Data sources). Other wallets and
+  portfolios never see it.
+
+Each key is tested against the provider, saved to `.env` (which `docker-compose.yml` bind-mounts into the
+container) as `NAME__REF` (e.g. `ZERION_API_KEY__3F9A1C07D2`, the reference being random per portfolio or
+wallet), and applied immediately, with no restart. Deleting a wallet or portfolio deletes its keys. Keys are shown
+only as `••••1a2b`, and changing them is limited to this computer unless `APP_PASSWORD` is set.
+
+Older installs with plain `ZERION_API_KEY=` / `DEBANK_ACCESS_KEY=` / `EXTENDED_API_KEY=` lines keep working, but
+only for the first portfolio (and the Extended key only for one of its wallets: the one matching
+`EXTENDED_WALLET_ADDRESS`, else the one that synced Extended). Saving that key again on the Data sources page
+replaces the old line.
 
 ### Upgrading an existing install
 

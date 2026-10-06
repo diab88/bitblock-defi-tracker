@@ -1,3 +1,5 @@
+import { grvtLogin } from './dexes.js';
+
 // External data sources. Only read-only public data keyed by wallet address is fetched;
 // no private keys or signatures are ever requested.
 
@@ -9,8 +11,9 @@ const DEBANK_CHAINS = {
   scrl: 'Scroll', mnt: 'Mantle', xdai: 'Gnosis', plasma: 'Plasma', sei: 'Sei', uni: 'Unichain', ink: 'Ink',
 };
 
-export function debankMode() {
-  if (process.env.DEBANK_ACCESS_KEY) return 'live';
+// Keys are per portfolio (DeBank, Zerion) or per wallet (Extended): callers pass the one that applies.
+export function debankMode(key) {
+  if (key) return 'live';
   if (process.env.DEBANK_MOCK === '1') return 'mock';
   return 'off';
 }
@@ -61,20 +64,20 @@ export function normalizeProtocols(protocols) {
   return items.sort((a, b) => b.netUsd - a.netUsd);
 }
 
-async function debankGet(path, params) {
+async function debankGet(path, params, key) {
   const url = `${DEBANK_BASE}${path}?${new URLSearchParams(params)}`;
-  const res = await fetch(url, { headers: { AccessKey: process.env.DEBANK_ACCESS_KEY, accept: 'application/json' } });
+  const res = await fetch(url, { headers: { AccessKey: key, accept: 'application/json' } });
   if (!res.ok) throw new Error(`DeBank ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
 
-export async function fetchDebankPortfolio(address) {
-  const mode = debankMode();
-  if (mode === 'off') throw Object.assign(new Error('DeBank is not configured. Set DEBANK_ACCESS_KEY (or DEBANK_MOCK=1 for demo data).'), { status: 400 });
+export async function fetchDebankPortfolio(address, key) {
+  const mode = debankMode(key);
+  if (mode === 'off') throw Object.assign(new Error('DeBank is not set up for this portfolio. Add a key on the Data sources page.'), { status: 400 });
   if (mode === 'mock') return mockPortfolio(address);
   const [balance, protocols] = await Promise.all([
-    debankGet('/v1/user/total_balance', { id: address }),
-    debankGet('/v1/user/all_complex_protocol_list', { id: address }),
+    debankGet('/v1/user/total_balance', { id: address }, key),
+    debankGet('/v1/user/all_complex_protocol_list', { id: address }, key),
   ]);
   return { totalUsd: balance.total_usd_value, chains: balance.chain_list || [], items: normalizeProtocols(protocols) };
 }
@@ -111,8 +114,8 @@ const ZERION_CHAINS = {
 };
 const LIQUID_STAKING = new Set(['stETH', 'wstETH', 'rETH', 'cbETH', 'weETH', 'JitoSOL', 'mSOL', 'bSOL', 'jupSOL', 'INF', 'sUSDe', 'sUSDS']);
 
-export function zerionMode() {
-  if (process.env.ZERION_API_KEY) return 'live';
+export function zerionMode(key) {
+  if (key) return 'live';
   if (process.env.ZERION_MOCK === '1') return 'mock';
   return 'off';
 }
@@ -220,17 +223,17 @@ export function normalizeZerion(rows, { walletByChain = false } = {}) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Zerion keys have low per-second limits: call sequentially and back off on 429.
-async function zerionGet(path, params, attempt = 0) {
+async function zerionGet(path, params, key, attempt = 0) {
   const url = `${ZERION_BASE}${path}?${new URLSearchParams(params)}`;
-  const auth = Buffer.from(`${process.env.ZERION_API_KEY}:`).toString('base64');
+  const auth = Buffer.from(`${key}:`).toString('base64');
   const res = await fetch(url, { headers: { authorization: `Basic ${auth}`, accept: 'application/json' } });
   if (res.status === 429 && attempt < 3) {
     const wait = Math.min(15, Number(res.headers.get('retry-after')) || 2 ** attempt * 1.5);
     await sleep(wait * 1000);
-    return zerionGet(path, params, attempt + 1);
+    return zerionGet(path, params, key, attempt + 1);
   }
   if (res.status === 429) throw Object.assign(new Error('Zerion rate limit reached — wait a minute and sync again.'), { status: 429 });
-  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(`Zerion rejected the API key (HTTP ${res.status}). Check ZERION_API_KEY in .env.`), { status: 400 });
+  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(`Zerion rejected the API key (HTTP ${res.status}). Check this portfolio’s Zerion key on the Data sources page.`), { status: 400 });
   if (!res.ok) throw new Error(`Zerion ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
@@ -317,13 +320,13 @@ export function detectExits(pools, txs) {
 export const detectExit = (pool, txs) => detectExits([{ id: 0, ...pool }], txs).get(0);
 
 // Recent decoded transactions, newest first (up to `pages` × 100).
-export async function fetchZerionTransactions(address, { pages = 3, chainIds } = {}) {
-  if (zerionMode() !== 'live') return [];
+export async function fetchZerionTransactions(address, { key, pages = 3, chainIds } = {}) {
+  if (zerionMode(key) !== 'live') return [];
   const out = [];
   let params = { currency: 'usd', 'page[size]': '100', ...(chainIds?.length ? { 'filter[chain_ids]': chainIds.join(',') } : {}) };
   let path = `/wallets/${address}/transactions/`;
   for (let i = 0; i < pages; i++) {
-    const res = await zerionGet(path, params);
+    const res = await zerionGet(path, params, key);
     out.push(...(res.data || []).map(normalizeZerionTx));
     const next = res.links?.next;
     if (!next || !(res.data || []).length) break;
@@ -383,16 +386,16 @@ export function matchTransactions(txs, positions) {
   return out;
 }
 
-export async function fetchZerionPortfolio(address, kind) {
-  const mode = zerionMode();
-  if (mode === 'off') throw Object.assign(new Error('Zerion is not configured. Set ZERION_API_KEY (or ZERION_MOCK=1 for demo data).'), { status: 400 });
+export async function fetchZerionPortfolio(address, kind, key) {
+  const mode = zerionMode(key);
+  if (mode === 'off') throw Object.assign(new Error('Zerion is not set up for this portfolio. Add a key on the Data sources page.'), { status: 400 });
   // EVM: DeFi positions plus plain wallet balances. Solana: Zerion has balances only.
   const filter = kind === 'solana' ? 'only_simple' : 'no_filter';
   const [portfolio, positions] = mode === 'mock'
     ? mockZerion(kind)
     : [
-      await zerionGet(`/wallets/${address}/portfolio`, { currency: 'usd', 'filter[positions]': 'no_filter' }),
-      await zerionGet(`/wallets/${address}/positions/`, { currency: 'usd', 'filter[positions]': filter, 'filter[trash]': 'only_non_trash', sort: '-value' }),
+      await zerionGet(`/wallets/${address}/portfolio`, { currency: 'usd', 'filter[positions]': 'no_filter' }, key),
+      await zerionGet(`/wallets/${address}/positions/`, { currency: 'usd', 'filter[positions]': filter, 'filter[trash]': 'only_non_trash', sort: '-value' }, key),
     ];
   return {
     totalUsd: portfolio?.data?.attributes?.total?.positions ?? null,
@@ -421,6 +424,50 @@ function mockZerion(kind) {
     row('z4', 'ethereum', 'staked', 'ETH', 5480, { protocol: 'Lido', group_id: 'lido-1', name: 'Staked', application_metadata: { name: 'Lido', url: 'https://lido.fi' } }),
   ];
   return [{ data: { attributes: { total: { positions: 13210.5 } } } }, { data: rows }];
+}
+
+// ---------- Wallet holdings ----------
+// Every plain token sitting in a wallet (not DeFi positions), from the portfolio's tracker: Zerion (EVM chains and
+// Solana) or DeBank (EVM chains). Without either, only the native coin can be read: SOL here via RPC; on EVM the
+// browser asks the wallet extension.
+
+export function normalizeZerionHoldings(rows) {
+  return dedupeZerionRows(rows)
+    .filter((r) => r.attributes.position_type === 'wallet' && !r.attributes.flags?.is_trash && r.attributes.flags?.displayable !== false)
+    .map((r) => {
+      const a = r.attributes;
+      const chainId = r.relationships?.chain?.data?.id || 'unknown';
+      return { symbol: a.fungible_info?.symbol || '?', name: a.fungible_info?.name || null, chain: ZERION_CHAINS[chainId] || chainId,
+        qty: Number(a.quantity?.float) || 0, priceUsd: a.price ?? null, valueUsd: a.value ?? null };
+    })
+    .filter((h) => h.qty > 0)
+    .sort((x, y) => (y.valueUsd ?? 0) - (x.valueUsd ?? 0));
+}
+
+export function normalizeDebankHoldings(tokens) {
+  return (tokens || [])
+    .filter((t) => t.is_wallet !== false && t.amount > 0)
+    .map((t) => ({ symbol: t.optimized_symbol || t.symbol || '?', name: t.name || null, chain: DEBANK_CHAINS[t.chain] || t.chain,
+      qty: t.amount, priceUsd: t.price ?? null, valueUsd: t.price != null ? t.amount * t.price : null }))
+    .sort((x, y) => (y.valueUsd ?? 0) - (x.valueUsd ?? 0));
+}
+
+export async function fetchWalletHoldings({ address, kind, zerionKey, debankKey }) {
+  if (zerionMode(zerionKey) === 'live') {
+    const res = await zerionGet(`/wallets/${address}/positions/`, { currency: 'usd', 'filter[positions]': 'only_simple', 'filter[trash]': 'only_non_trash', sort: '-value' }, zerionKey);
+    return { source: 'zerion', holdings: normalizeZerionHoldings(res.data || []) };
+  }
+  if (kind === 'evm' && debankMode(debankKey) === 'live') {
+    return { source: 'debank', holdings: normalizeDebankHoldings(await debankGet('/v1/user/all_token_list', { id: address, is_all: 'false' }, debankKey)) };
+  }
+  if (zerionMode(zerionKey) === 'mock') {
+    const row = (id, chain, symbol, qty, price) => ({ id, type: 'positions', attributes: { position_type: 'wallet', quantity: { float: qty }, price, value: qty * price, fungible_info: { symbol, name: symbol }, flags: { displayable: true, is_trash: false } }, relationships: { chain: { data: { id: chain } } } });
+    const rows = kind === 'solana' ? mockZerion('solana')[1].data
+      : [row('h1', 'ethereum', 'ETH', 1.25, 3200), row('h2', 'base', 'USDC', 840.5, 1), row('h3', 'arbitrum', 'ARB', 300, 0.42), row('h4', 'base', 'DEGEN', 12, 0.004)];
+    return { source: 'zerion', holdings: normalizeZerionHoldings(rows), mock: true };
+  }
+  if (kind === 'solana') return { source: 'solana-rpc', nativeOnly: true, holdings: [{ symbol: 'SOL', name: 'Solana', chain: 'Solana', qty: await fetchSolanaBalance(address), priceUsd: null, valueUsd: null }] };
+  return { source: null, holdings: [] };
 }
 
 // ---------- Lighter (public API, no key) ----------
@@ -587,16 +634,16 @@ export function applyTrackFrom(item, since, priceAt = {}) {
 
 const EXTENDED_BASE = process.env.EXTENDED_API_URL || 'https://api.starknet.extended.exchange/api/v1';
 
-export function extendedMode() {
-  return process.env.EXTENDED_API_KEY ? 'live' : 'off';
+export function extendedMode(key) {
+  return key ? 'live' : 'off';
 }
 
-async function extendedGet(path) {
+async function extendedGet(path, key) {
   const res = await fetch(`${EXTENDED_BASE}${path}`, {
-    headers: { 'X-Api-Key': process.env.EXTENDED_API_KEY, 'User-Agent': 'BitBlockDeFiTracker/1.0', accept: 'application/json' },
+    headers: { 'X-Api-Key': key, 'User-Agent': 'BitBlockDeFiTracker/1.0', accept: 'application/json' },
   });
   if (res.status === 404) return null; // Extended answers 404 for an empty balance
-  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(`Extended rejected the API key (HTTP ${res.status}). Check EXTENDED_API_KEY in .env.`), { status: 400 });
+  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(`Extended rejected the API key (HTTP ${res.status}). Check the Extended key linked to this wallet.`), { status: 400 });
   if (!res.ok) throw new Error(`Extended ${path} → HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
@@ -663,13 +710,13 @@ export function extendedItem(balance, positions, operations, spotBalances = [], 
   };
 }
 
-export async function fetchExtendedPortfolio() {
-  if (extendedMode() === 'off') throw Object.assign(new Error('Extended is not configured. Create a read-only API key in Extended → API management and set EXTENDED_API_KEY.'), { status: 400 });
-  const balance = await extendedGet('/user/balance');
-  const positions = await extendedGet('/user/positions');
-  const ops = await extendedGet('/user/assetOperations?limit=1000');
-  const spot = await extendedGet('/user/spot/balances');
-  const history = await extendedGet('/user/positions/history?limit=500');
+export async function fetchExtendedPortfolio(key) {
+  if (extendedMode(key) === 'off') throw Object.assign(new Error('No Extended account is linked to this wallet.'), { status: 400 });
+  const balance = await extendedGet('/user/balance', key);
+  const positions = await extendedGet('/user/positions', key);
+  const ops = await extendedGet('/user/assetOperations?limit=1000', key);
+  const spot = await extendedGet('/user/spot/balances', key);
+  const history = await extendedGet('/user/positions/history?limit=500', key);
   const item = extendedItem(balance?.data, positions?.data, ops?.data, spot?.data || [], history?.data || []);
   if (!item.reconcile.ok) console.warn(`Extended P/L does not reconcile: parts ${item.reconcile.parts.toFixed(2)} vs account ${item.reconcile.pnl.toFixed(2)}`);
   return { totalUsd: item.netUsd, items: item.netUsd > 0 || item.depositUsd ? [item] : [] };
@@ -689,10 +736,16 @@ export async function testProviderKey(provider, key) {
     zerion: () => fetch(`${ZERION_BASE}/chains/`, { headers: { authorization: `Basic ${Buffer.from(`${key}:`).toString('base64')}`, accept: 'application/json' } }),
     debank: () => fetch(`${DEBANK_BASE}/v1/account/units`, { headers: { AccessKey: key, accept: 'application/json' } }),
     extended: () => fetch(`${EXTENDED_BASE}/user/balance`, { headers: { 'X-Api-Key': key, 'User-Agent': 'BitBlockDeFiTracker/1.0', accept: 'application/json' } }),
+    grvt: async () => {
+      const r = await grvtLogin(key);
+      if (r.ok && !r.subAccountId) return { ok: false, status: 400, custom: 'This GRVT key isn’t tied to a trading account: create a Trading API key (not a Funding key)' };
+      return { ok: r.ok, status: r.ok ? 200 : r.status };
+    },
   }[provider];
   if (!req) return { ok: false, message: 'unknown provider' };
   try {
     const res = await req();
+    if (res.custom) return { ok: false, message: res.custom };
     if (res.ok || (provider === 'extended' && res.status === 404)) return { ok: true, message: 'Key accepted' }; // Extended: 404 = empty account
     if (res.status === 401 || res.status === 403) return { ok: false, message: `The ${provider} API rejected this key (HTTP ${res.status})` };
     if (res.status === 429) return { ok: false, message: 'Rate limited by the provider; try again in a minute' };

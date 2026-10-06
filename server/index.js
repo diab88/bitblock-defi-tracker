@@ -5,8 +5,9 @@ import { openDb, CHAINS, STRATEGIES } from './db.js';
 import { computeExposure, detectHedges, underlying } from './hedges.js';
 import { computePosition, summarizeByCurrency, portfolioSeries, positionSeries } from './calc.js';
 import { fetchCoingeckoHistory, testProviderKey } from './integrations.js';
-import { KEYED_SOURCES, validateKey, maskKey, envFilePath, envFileStatus, writeEnvValue } from './settings.js';
-import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExits, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, isEvmAddress, isSolanaAddress } from './integrations.js';
+import { fetchHyperliquidPortfolio, fetchGmxPortfolio, fetchBulkPortfolio, fetchGrvtPortfolio } from './dexes.js';
+import { KEYED_SOURCES, DEXES, validateKey, maskKey, envFilePath, envFileStatus, writeEnvValue, removeEnvValues, scopedEnvName, newKeyRef } from './settings.js';
+import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExits, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, fetchWalletHoldings, isEvmAddress, isSolanaAddress } from './integrations.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PORT = Number(process.env.PORT || 8080);
@@ -139,6 +140,8 @@ app.delete('/api/portfolios/:id', (req, res) => {
   if (!p) throw new HttpError(404, 'portfolio not found');
   if (portfolioRows().length === 1) throw new HttpError(400, 'you need at least one portfolio');
   if (p.wallets || p.positions) throw new HttpError(400, `“${p.name}” still has ${p.wallets} wallet(s) and ${p.positions} position(s); remove or move them first`);
+  const row = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(p.id);
+  for (const id of portfolioSourceIds) if (portfolioKey(id, p.id).key) forgetKey(id, { table: 'portfolios', row });
   db.prepare('DELETE FROM portfolios WHERE id = ?').run(p.id);
   res.json({ ok: true });
 });
@@ -153,10 +156,12 @@ app.get('/api/meta', (req, res) => {
     currencies: db.prepare('SELECT symbol FROM prices ORDER BY rowid').all().map((r) => r.symbol),
     wallets: db.prepare('SELECT * FROM wallets WHERE portfolio_id = ? ORDER BY name').all(req.pid),
     protocols: db.prepare('SELECT DISTINCT protocol FROM positions WHERE protocol IS NOT NULL AND portfolio_id = ? ORDER BY protocol').all(req.pid).map((r) => r.protocol),
-    debank: debankMode(),
-    zerion: zerionMode(),
+    debank: debankMode(portfolioKey('debank', req.pid).key),
+    zerion: zerionMode(portfolioKey('zerion', req.pid).key),
     lighter: lighterMode(),
-    extended: extendedMode(),
+    // Exchange accounts are opt-in per wallet: 'live' only once a wallet in this portfolio has one linked.
+    extended: db.prepare('SELECT * FROM wallets WHERE portfolio_id = ?').all(req.pid).some((w) => walletKey('extended', w).key) ? 'live' : 'off',
+    dexes: dexList(),
     autoSyncHours: AUTO_SYNC_HOURS,
   });
 });
@@ -408,7 +413,7 @@ app.get('/api/wallets', (req, res) => {
   const wallets = db.prepare('SELECT * FROM wallets WHERE portfolio_id = ? ORDER BY name').all(req.pid);
   const snap = db.prepare('SELECT provider, fetched_at, total_usd FROM debank_snapshots WHERE wallet_id = ? ORDER BY id DESC LIMIT 1');
   const count = db.prepare('SELECT COUNT(*) n FROM positions WHERE wallet_id = ?');
-  res.json(wallets.map((w) => ({ ...w, positions: count.get(w.id).n, lastSync: snap.get(w.id) ?? null })));
+  res.json(wallets.map(({ key_ref, ...w }) => ({ ...w, positions: count.get(w.id).n, lastSync: snap.get(w.id) ?? null, exchanges: walletExchanges({ key_ref, ...w }) })));
 });
 
 app.post('/api/wallets', (req, res) => {
@@ -460,9 +465,21 @@ app.put('/api/wallets/:id', (req, res) => {
 });
 
 app.delete('/api/wallets/:id', (req, res) => {
-  db.prepare('DELETE FROM wallets WHERE id = ?').run(getWallet(req.params.id, req.pid).id);
+  const w = getWallet(req.params.id, req.pid);
+  for (const id of walletSourceIds) if (walletKey(id, w).key) forgetKey(id, { table: 'wallets', row: w });
+  db.prepare('DELETE FROM wallets WHERE id = ?').run(w.id);
   res.json({ ok: true });
 });
+
+// Every token in the wallet now, from this portfolio's tracker (see fetchWalletHoldings).
+app.get('/api/wallets/:id/holdings', wrap(async (req, res) => {
+  const w = getWallet(req.params.id, req.pid);
+  if (!w.address) throw new HttpError(400, 'This wallet has no address.');
+  const r = await fetchWalletHoldings({ address: w.address, kind: w.kind, zerionKey: portfolioKey('zerion', w.portfolio_id).key, debankKey: portfolioKey('debank', w.portfolio_id).key });
+  const prices = priceMap();
+  for (const h of r.holdings) if (h.priceUsd == null && prices[h.symbol]?.usd_price > 0) { h.priceUsd = prices[h.symbol].usd_price; h.valueUsd = h.qty * h.priceUsd; }
+  res.json({ ...r, totalUsd: r.holdings.reduce((t, h) => t + (h.valueUsd || 0), 0), fetchedAt: new Date().toISOString() });
+}));
 
 app.get('/api/wallets/:id/balance', wrap(async (req, res) => {
   const w = getWallet(req.params.id, req.pid);
@@ -470,21 +487,116 @@ app.get('/api/wallets/:id/balance', wrap(async (req, res) => {
   res.json({ symbol: 'SOL', balance: await fetchSolanaBalance(w.address) });
 }));
 
+// ---------- API keys (per portfolio / per wallet) ----------
+// Zerion and DeBank keys belong to a portfolio, exchange accounts (Extended) to one wallet; nothing is shared
+// between portfolios. Each key is stored in .env as NAME__REF, REF being the portfolio's or wallet's random
+// key_ref (server/settings.js).
+// Before keys were scoped, .env held one plain key per source (ZERION_API_KEY=…). Such a key still works, but
+// only for the first portfolio, and a plain EXTENDED_API_KEY only for one wallet of it (legacyExtendedWallet).
+// Saving or removing that portfolio's / wallet's key from the UI replaces it.
+const ENV_FILE = envFilePath(root);
+const portfolioSourceIds = Object.keys(KEYED_SOURCES).filter((id) => KEYED_SOURCES[id].scope === 'portfolio');
+const walletSourceIds = Object.keys(KEYED_SOURCES).filter((id) => KEYED_SOURCES[id].scope === 'wallet');
+const firstPortfolioId = () => db.prepare('SELECT MIN(id) id FROM portfolios').get().id;
+const NO_KEY = { key: null, from: null };
+
+function portfolioKey(id, pid) {
+  const src = KEYED_SOURCES[id];
+  const p = db.prepare('SELECT id, key_ref FROM portfolios WHERE id = ?').get(pid);
+  if (!p) return NO_KEY;
+  const own = p.key_ref && process.env[scopedEnvName(src, p.key_ref)];
+  if (own) return { key: own, from: 'own' };
+  if (p.id === firstPortfolioId() && process.env[src.env]) return { key: process.env[src.env], from: 'legacy' };
+  return NO_KEY;
+}
+
+// The one wallet an old unscoped EXTENDED_API_KEY belongs to: the first portfolio's EVM wallet matching
+// EXTENDED_WALLET_ADDRESS, else the one that last synced Extended, else its first EVM wallet.
+function legacyExtendedWallet() {
+  if (!process.env.EXTENDED_API_KEY) return null;
+  const evm = db.prepare("SELECT id, address FROM wallets WHERE portfolio_id = ? AND kind = 'evm' ORDER BY id").all(firstPortfolioId());
+  const pin = process.env.EXTENDED_WALLET_ADDRESS?.trim().toLowerCase();
+  if (pin) return evm.find((w) => w.address?.toLowerCase() === pin)?.id ?? null;
+  const ids = new Set(evm.map((w) => w.id));
+  const synced = db.prepare("SELECT wallet_id FROM debank_snapshots WHERE provider = 'extended' ORDER BY id DESC").all().find((r) => ids.has(r.wallet_id));
+  return synced?.wallet_id ?? evm[0]?.id ?? null;
+}
+
+function walletKey(id, w) {
+  const src = KEYED_SOURCES[id];
+  if (!w || !src.kinds.includes(w.kind)) return NO_KEY;
+  const own = w.key_ref && process.env[scopedEnvName(src, w.key_ref)];
+  if (own) return { key: own, from: 'own' };
+  if (id === 'extended' && legacyExtendedWallet() === w.id) return { key: process.env.EXTENDED_API_KEY, from: 'legacy' };
+  return NO_KEY;
+}
+
+// DEX accounts are opt-in per wallet: a key DEX is linked when the wallet has its key, an address DEX when
+// it was added (dex_accounts).
+function dexLinked(id, w) {
+  const d = DEXES[id];
+  if (!d || !w || !d.kinds.includes(w.kind)) return false;
+  if (d.auth === 'key') return !!walletKey(id, w).key;
+  return !!db.prepare('SELECT 1 FROM dex_accounts WHERE wallet_id = ? AND dex = ?').get(w.id, id);
+}
+
+// DEX accounts linked to a wallet, for the browser (keys masked).
+const walletExchanges = (w) => Object.fromEntries(Object.keys(DEXES).filter((id) => dexLinked(id, w)).map((id) => {
+  const k = DEXES[id].auth === 'key' ? walletKey(id, w) : null;
+  return [id, { auth: DEXES[id].auth, ...(k ? { masked: maskKey(k.key), from: k.from } : {}) }];
+}));
+
+// Write a key for a portfolio or wallet (t = { table, row, current }) to .env and apply it now.
+function storeKey(id, t, key) {
+  const src = KEYED_SOURCES[id];
+  let ref = t.row.key_ref;
+  if (!ref) { ref = newKeyRef(); db.prepare(`UPDATE ${t.table} SET key_ref = ? WHERE id = ?`).run(ref, t.row.id); }
+  const name = scopedEnvName(src, ref);
+  const file = envFileStatus(ENV_FILE);
+  if (file.writable) writeEnvValue(ENV_FILE, name, key);
+  process.env[name] = key;
+  if (t.current.from === 'legacy') clearLegacy(src, file.writable); // the old shared line is replaced by this one
+  console.log(`settings: ${src.label} key ${t.current.key ? 'replaced' : 'added'} for ${t.table === 'wallets' ? 'wallet' : 'portfolio'} #${t.row.id}${file.writable ? ' in .env' : ' for this session only (.env not writable)'}`);
+  return { saved: file.writable, reason: file.reason };
+}
+
+function forgetKey(id, t) {
+  const src = KEYED_SOURCES[id];
+  const file = envFileStatus(ENV_FILE);
+  if (t.row.key_ref) {
+    const name = scopedEnvName(src, t.row.key_ref);
+    if (file.writable) removeEnvValues(ENV_FILE, [name]);
+    delete process.env[name];
+  }
+  if (t.current?.from === 'legacy' || (!t.current && (t.table === 'wallets' ? walletKey(id, t.row) : portfolioKey(id, t.row.id)).from === 'legacy')) clearLegacy(src, file.writable);
+  console.log(`settings: ${src.label} key removed from ${t.table === 'wallets' ? 'wallet' : 'portfolio'} #${t.row.id}`);
+  return file.writable;
+}
+
+function clearLegacy(src, writable) {
+  if (writable) writeEnvValue(ENV_FILE, src.env, '');
+  delete process.env[src.env];
+}
+
 function linkedPositions(walletId) {
   return db.prepare('SELECT id, debank_key, currency, closed FROM positions WHERE wallet_id = ? AND debank_key IS NOT NULL').all(walletId);
 }
 
+// key(w): the credential this wallet syncs with: its portfolio's key (DeBank, Zerion), its own linked
+// exchange account (Extended), or none (Lighter is public). mode(key) says whether the source is usable.
 const PROVIDERS = {
-  debank: { label: 'DeBank', mode: debankMode, kinds: ['evm'], fetch: (w) => fetchDebankPortfolio(w.address) },
-  zerion: { label: 'Zerion', mode: zerionMode, kinds: ['evm', 'solana'], fetch: (w) => fetchZerionPortfolio(w.address, w.kind) },
-  extended: {
-    label: 'Extended', mode: extendedMode, kinds: ['evm'], fetch: () => fetchExtendedPortfolio(),
-    // One key = one Extended account; pin it to a wallet with EXTENDED_WALLET_ADDRESS when you have several.
-    allows: (w) => !process.env.EXTENDED_WALLET_ADDRESS || w.address?.toLowerCase() === process.env.EXTENDED_WALLET_ADDRESS.toLowerCase(),
-  },
+  debank: { label: 'DeBank', mode: debankMode, kinds: ['evm'], key: (w) => portfolioKey('debank', w.portfolio_id).key, fetch: (w, key) => fetchDebankPortfolio(w.address, key) },
+  zerion: { label: 'Zerion', mode: zerionMode, kinds: ['evm', 'solana'], key: (w) => portfolioKey('zerion', w.portfolio_id).key, fetch: (w, key) => fetchZerionPortfolio(w.address, w.kind, key) },
+  // One key = one Extended account, linked to one wallet.
+  extended: { label: 'Extended', mode: extendedMode, kinds: ['evm'], key: (w) => walletKey('extended', w).key, fetch: (_w, key) => fetchExtendedPortfolio(key) },
   // After Extended on purpose: a hedged token's long leg is priced at the perp's mark (set during Extended's sync).
-  lighter: { label: 'Lighter', mode: lighterMode, kinds: ['evm'], fetch: (w) => fetchLighterPortfolio(w.address) },
+  lighter: { label: 'Lighter', mode: lighterMode, kinds: ['evm'], key: () => null, fetch: (w) => fetchLighterPortfolio(w.address) },
+  hyperliquid: { label: 'Hyperliquid', mode: () => 'live', kinds: ['evm'], key: () => null, fetch: (w) => fetchHyperliquidPortfolio(w.address) },
+  gmx: { label: 'GMX', mode: () => 'live', kinds: ['evm'], key: () => null, fetch: (w) => fetchGmxPortfolio(w.address) },
+  bulk: { label: 'Bulk', mode: () => 'live', kinds: ['solana'], key: () => null, fetch: (w) => fetchBulkPortfolio(w.address) },
+  grvt: { label: 'GRVT', mode: (key) => (key ? 'live' : 'off'), kinds: ['evm', 'solana'], key: (w) => walletKey('grvt', w).key, fetch: (_w, key) => fetchGrvtPortfolio(key) },
 };
+const providerMode = (id, w) => (DEXES[id] && !dexLinked(id, w) ? 'off' : PROVIDERS[id].mode(PROVIDERS[id].key(w)));
 const keyProvider = (key) => {
   const prefix = key?.split('|')[0];
   return PROVIDERS[prefix] && prefix !== 'debank' ? prefix : 'debank'; // DeBank keys predate the prefix
@@ -567,8 +679,10 @@ async function syncWallet(walletId, provider) {
       ? `${src.label} covers EVM addresses only. Use Zerion for Solana.`
       : 'This wallet has no address to sync.');
   }
-  if (src.allows && !src.allows(w)) throw new HttpError(400, `${src.label} is pinned to another wallet (EXTENDED_WALLET_ADDRESS).`);
-  const pf = await src.fetch(w);
+  const key = src.key(w);
+  if (DEXES[provider] && !dexLinked(provider, w)) throw new HttpError(400, `No ${src.label} account is linked to this wallet. Add it with “Add DEX account”.`);
+  if (src.mode(key) === 'off') throw new HttpError(400, `${src.label} isn’t set up for this portfolio. Add its key on the Data sources page.`);
+  const pf = await src.fetch(w, key);
   if (w.track_from && w.track_from < today()) {
     const needs = pf.items.flatMap((i) => [
       ...(i.positions || []).filter((p) => p.openedAt && p.openedAt < w.track_from).map((p) => String(p.market).split('-')[0]),
@@ -726,7 +840,7 @@ async function scanActivity(w) {
     return item && { id: p.id, protocol: item.protocol, chainId: item.chainId, tokens: item.tokens, valueUsd: item.netUsd };
   }).filter(Boolean);
   if (!positions.length) return 0;
-  const txs = (await fetchZerionTransactions(w.address, { chainIds: [...new Set(positions.map((p) => p.chainId))] }))
+  const txs = (await fetchZerionTransactions(w.address, { key: portfolioKey('zerion', w.portfolio_id).key, chainIds: [...new Set(positions.map((p) => p.chainId))] }))
     .filter((t) => !w.track_from || t.date >= w.track_from);
   const ins = db.prepare('INSERT OR IGNORE INTO suggestions (position_id, kind, tx_id, date, amount_usd, detail) VALUES (?, ?, ?, ?, ?, ?)');
   let n = 0;
@@ -739,7 +853,7 @@ async function scanActivity(w) {
 
 app.post('/api/wallets/:id/scan-activity', wrap(async (req, res) => {
   const w = getWallet(req.params.id, req.pid);
-  if (zerionMode() !== 'live') throw new HttpError(400, 'Scanning transactions needs ZERION_API_KEY.');
+  if (zerionMode(portfolioKey('zerion', w.portfolio_id).key) !== 'live') throw new HttpError(400, 'Scanning transactions needs a Zerion key for this portfolio (Data sources page).');
   res.json({ suggested: await scanActivity(w) });
 }));
 
@@ -932,24 +1046,51 @@ async function refreshPrices() {
 app.post('/api/prices/refresh', wrap(async (_req, res) => res.json(await refreshPrices())));
 
 // ---------- settings: API keys ----------
-// Keys are kept in .env (see server/settings.js) and applied to the running app at once. The browser only
-// ever sees a masked form. Changing keys is limited to this computer unless APP_PASSWORD protects the app.
-const ENV_FILE = envFilePath(root);
+// Routes for keys kept in .env (see server/settings.js); the key lookup itself is in "API keys" above.
+// Changing keys is limited to this computer unless APP_PASSWORD protects the app.
 const isLocalHost = (req) => /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(req.get('host') || '');
 const settingsWriteGuard = (req) => {
   if (!process.env.APP_PASSWORD && !isLocalHost(req)) throw new HttpError(403, 'Set APP_PASSWORD before changing API keys over the network.');
 };
 const sourceOrThrow = (id) => { const s = KEYED_SOURCES[id]; if (!s) throw new HttpError(404, 'unknown data source'); return s; };
-const modeOf = { zerion: zerionMode, debank: debankMode, extended: extendedMode };
 
-app.get('/api/settings', (_req, res) => {
+const dexList = () => Object.entries(DEXES).map(([id, d]) => ({ id, label: d.label, auth: d.auth, kinds: d.kinds, url: d.url, what: d.what, keyHelp: d.keyHelp || null, beta: !!d.beta, available: d.available !== false }));
+
+// What the last sync of a DEX account found.
+function dexAccountStatus(w, id) {
+  const s = db.prepare('SELECT fetched_at, total_usd, items FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1').get(w.id, id);
+  if (!s) return { synced: false };
+  const m = JSON.parse(s.items);
+  return { synced: true, found: (Array.isArray(m) ? m : m.items).length > 0, totalUsd: s.total_usd, fetchedAt: s.fetched_at };
+}
+
+// What a request's key belongs to: the active portfolio, or (exchange accounts) one of its wallets (?wallet=).
+function keyTarget(req) {
+  const src = sourceOrThrow(req.params.id);
+  if (src.scope === 'wallet') {
+    const wid = Number(req.query.wallet ?? req.body?.wallet);
+    if (!wid) throw new HttpError(400, `${src.label} accounts are linked to a wallet: choose one`);
+    const w = getWallet(wid, req.pid);
+    if (!src.kinds.includes(w.kind)) throw new HttpError(400, `${src.label} accounts can only be linked to EVM wallets`);
+    return { src, table: 'wallets', row: w, current: walletKey(req.params.id, w) };
+  }
+  return { src, table: 'portfolios', row: db.prepare('SELECT * FROM portfolios WHERE id = ?').get(req.pid), current: portfolioKey(req.params.id, req.pid) };
+}
+const keyView = (id, k, mode) => ({ configured: !!k.key, masked: maskKey(k.key), mode, from: k.from, legacyEnv: k.from === 'legacy' ? KEYED_SOURCES[id].env : null });
+
+app.get('/api/settings', (req, res) => {
   const file = envFileStatus(ENV_FILE);
+  const wallets = db.prepare("SELECT * FROM wallets WHERE portfolio_id = ? ORDER BY name").all(req.pid);
   res.json({
+    portfolio: portfolioRows().find((p) => p.id === req.pid),
     envFile: { ...file, path: process.env.ENV_FILE ? ENV_FILE : '.env' },
-    sources: Object.entries(KEYED_SOURCES).map(([id, s]) => ({
-      id, label: s.label, env: s.env, url: s.url, what: s.what,
-      configured: !!process.env[s.env], masked: maskKey(process.env[s.env]), mode: modeOf[id](),
-    })),
+    sources: portfolioSourceIds.map((id) => {
+      const s = KEYED_SOURCES[id], k = portfolioKey(id, req.pid);
+      return { id, label: s.label, url: s.url, what: s.what, scope: s.scope, ...keyView(id, k, PROVIDERS[id].mode(k.key)) };
+    }),
+    dexes: dexList(),
+    wallets: wallets.map((w) => ({ id: w.id, name: w.name, address: w.address, kind: w.kind,
+      exchanges: Object.fromEntries(Object.entries(walletExchanges(w)).map(([id, x]) => [id, { ...x, account: dexAccountStatus(w, id) }])) })),
     lighter: lighterMode(),
   });
 });
@@ -957,36 +1098,71 @@ app.get('/api/settings', (_req, res) => {
 // Save a key: validate → test it against the provider (unless test=false) → write .env → apply now.
 app.put('/api/settings/:id', wrap(async (req, res) => {
   settingsWriteGuard(req);
-  const src = sourceOrThrow(req.params.id);
+  const t = keyTarget(req);
   const v = validateKey(req.body?.key);
   if (!v.ok) throw new HttpError(400, v.error);
   if (req.body?.test !== false) {
-    const t = await testProviderKey(req.params.id, v.key);
-    if (!t.ok) throw new HttpError(400, `${t.message}. The key was not saved.`);
+    const r = await testProviderKey(req.params.id, v.key);
+    if (!r.ok) throw new HttpError(400, `${r.message}. The key was not saved.`);
   }
-  const file = envFileStatus(ENV_FILE);
-  let saved = false;
-  if (file.writable) { writeEnvValue(ENV_FILE, src.env, v.key); saved = true; }
-  process.env[src.env] = v.key;
-  console.log(`settings: ${src.env} updated${saved ? ' in .env' : ' for this session only (.env not writable)'}`);
-  res.json({ ok: true, masked: maskKey(v.key), saved, mode: modeOf[req.params.id](),
-    warning: saved ? null : `Applied until the app restarts, but not saved: ${file.reason}. Add it to .env by hand to keep it.` });
+  const { saved, reason } = storeKey(req.params.id, t, v.key);
+  res.json({ ok: true, masked: maskKey(v.key), saved, mode: PROVIDERS[req.params.id].mode(v.key),
+    warning: saved ? null : `Applied until the app restarts, but not saved: ${reason}. Add it to .env by hand to keep it.` });
 }));
 
 app.delete('/api/settings/:id', (req, res) => {
   settingsWriteGuard(req);
-  const src = sourceOrThrow(req.params.id);
-  const file = envFileStatus(ENV_FILE);
-  if (file.writable) writeEnvValue(ENV_FILE, src.env, '');
-  delete process.env[src.env];
-  res.json({ ok: true, saved: file.writable, mode: modeOf[req.params.id]() });
+  const t = keyTarget(req);
+  if (!t.current.key) throw new HttpError(404, `No ${t.src.label} key is set here`);
+  const saved = forgetKey(req.params.id, t);
+  res.json({ ok: true, saved });
 });
 
 app.post('/api/settings/:id/test', wrap(async (req, res) => {
-  const src = sourceOrThrow(req.params.id);
-  if (!process.env[src.env]) throw new HttpError(400, `No ${src.label} key is set`);
-  res.json(await testProviderKey(req.params.id, process.env[src.env]));
+  const t = keyTarget(req);
+  if (!t.current.key) throw new HttpError(400, `No ${t.src.label} key is set here`);
+  res.json(await testProviderKey(req.params.id, t.current.key));
 }));
+
+// Add a DEX account to a wallet ("Add DEX account"): a key DEX tests and stores the key; an address DEX is
+// looked up once so you know straight away whether an account exists at that address.
+app.post('/api/wallets/:id/dex', wrap(async (req, res) => {
+  settingsWriteGuard(req);
+  const w = getWallet(req.params.id, req.pid);
+  const id = String(req.body?.dex || '');
+  const d = DEXES[id];
+  if (!d) throw new HttpError(404, 'unknown DEX');
+  if (d.available === false) throw new HttpError(400, `${d.label} can’t be connected yet: ${d.what}.`);
+  if (!d.kinds.includes(w.kind)) throw new HttpError(400, `${d.label} accounts can only be added to ${d.kinds.map((k) => k.toUpperCase()).join(' / ')} wallets`);
+  if (d.auth === 'key') {
+    const v = validateKey(req.body?.key);
+    if (!v.ok) throw new HttpError(400, v.error);
+    if (req.body?.test !== false) {
+      const r = await testProviderKey(id, v.key);
+      if (!r.ok) throw new HttpError(400, `${r.message}. The key was not saved.`);
+    }
+    const { saved, reason } = storeKey(id, { src: KEYED_SOURCES[id], table: 'wallets', row: w, current: walletKey(id, w) }, v.key);
+    db.prepare('INSERT OR IGNORE INTO dex_accounts (wallet_id, dex) VALUES (?, ?)').run(w.id, id);
+    return res.json({ ok: true, dex: id, masked: maskKey(v.key), saved, warning: saved ? null : `Applied until the app restarts, but not saved: ${reason}. Add it to .env by hand to keep it.` });
+  }
+  db.prepare('INSERT OR IGNORE INTO dex_accounts (wallet_id, dex) VALUES (?, ?)').run(w.id, id);
+  let found = null;
+  if (req.body?.test !== false && PROVIDERS[id].mode(null) !== 'off') {
+    try { found = (await PROVIDERS[id].fetch(w, null)).items.length > 0; } catch (e) { console.warn(`${d.label} lookup failed: ${e.message}`); }
+  }
+  res.json({ ok: true, dex: id, found });
+}));
+
+// Remove a DEX account from a wallet. Positions already tracked from it are kept; they just stop updating.
+app.delete('/api/wallets/:id/dex/:dex', (req, res) => {
+  settingsWriteGuard(req);
+  const w = getWallet(req.params.id, req.pid);
+  const d = DEXES[req.params.dex];
+  if (!d || !dexLinked(req.params.dex, w)) throw new HttpError(404, 'that DEX account is not linked to this wallet');
+  if (d.auth === 'key') forgetKey(req.params.dex, { src: KEYED_SOURCES[req.params.dex], table: 'wallets', row: w, current: walletKey(req.params.dex, w) });
+  db.prepare('DELETE FROM dex_accounts WHERE wallet_id = ? AND dex = ?').run(w.id, req.params.dex);
+  res.json({ ok: true });
+});
 
 // ---------- backup ----------
 // Full backup of every portfolio (version 2 adds portfolios and correction history; version 1 files still import).
@@ -997,6 +1173,7 @@ app.get('/api/export', (_req, res) => {
     exportedAt: new Date().toISOString(),
     portfolios: db.prepare('SELECT * FROM portfolios').all(),
     event_revisions: db.prepare('SELECT * FROM event_revisions').all(),
+    dex_accounts: db.prepare('SELECT * FROM dex_accounts').all(),
     wallets: db.prepare('SELECT * FROM wallets').all(),
     positions: db.prepare('SELECT * FROM positions').all(),
     events: db.prepare('SELECT * FROM events').all(),
@@ -1020,7 +1197,7 @@ app.post('/api/import', (req, res) => {
   if (![1, 2].includes(b?.version) || !Array.isArray(b.positions)) throw new HttpError(400, 'not a BitBlock DeFi Tracker export file');
   db.exec('BEGIN');
   try {
-    db.exec('DELETE FROM suggestions; DELETE FROM event_revisions; DELETE FROM events; DELETE FROM positions; DELETE FROM debank_snapshots; DELETE FROM wallets; DELETE FROM portfolios;');
+    db.exec('DELETE FROM dex_accounts; DELETE FROM suggestions; DELETE FROM event_revisions; DELETE FROM events; DELETE FROM positions; DELETE FROM debank_snapshots; DELETE FROM wallets; DELETE FROM portfolios;');
     const ins = (table, rows) => {
       const allowed = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
       for (const r of rows || []) {
@@ -1033,7 +1210,9 @@ app.post('/api/import', (req, res) => {
     const pid1 = db.prepare('SELECT MIN(id) id FROM portfolios').get().id;
     ins('wallets', (b.wallets || []).map((w) => ({ portfolio_id: pid1, ...w })));
     ins('positions', (b.positions || []).map((x) => ({ portfolio_id: (b.wallets || []).find((w) => w.id === x.wallet_id)?.portfolio_id ?? pid1, ...x })));
-    ins('events', b.events); ins('prices', b.prices); ins('event_revisions', b.event_revisions);
+    ins('events', b.events); ins('prices', b.prices); ins('event_revisions', b.event_revisions); ins('dex_accounts', b.dex_accounts);
+    // Backups from before DEX accounts were opt-in: keep Lighter on wallets that track Lighter positions.
+    if (!b.dex_accounts) db.exec("INSERT OR IGNORE INTO dex_accounts (wallet_id, dex) SELECT DISTINCT p.wallet_id, 'lighter' FROM positions p JOIN wallets w ON w.id = p.wallet_id WHERE p.debank_key LIKE 'lighter|%'");
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw new HttpError(400, `import failed: ${e.message}`); }
   res.json({ ok: true, positions: b.positions.length });
@@ -1049,7 +1228,7 @@ async function syncAll(trigger = 'auto', pid = null) {
   const wallets = db.prepare(`SELECT * FROM wallets WHERE address IS NOT NULL AND kind != 'manual' ${pid ? 'AND portfolio_id = ?' : ''}`).all(...(pid ? [pid] : []));
   for (const w of wallets) {
     for (const [id, src] of Object.entries(PROVIDERS)) {
-      if (src.mode() === 'off' || !src.kinds.includes(w.kind) || (src.allows && !src.allows(w))) continue;
+      if (!src.kinds.includes(w.kind) || providerMode(id, w) === 'off') continue;
       try {
         const r = await syncWallet(w.id, id);
         results.push({ wallet: w.name, source: src.label, ok: true, items: r.items.length, updated: r.updated.length, suggested: r.suggested || 0, closedList: r.closed || [] });
@@ -1092,4 +1271,9 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: err.message });
 });
 
-app.listen(PORT, () => console.log(`BitBlock DeFi Tracker is running: open http://localhost:${process.env.PUBLIC_PORT || PORT} (DeBank: ${debankMode()}, Zerion: ${zerionMode()}, Lighter: ${lighterMode()}, Extended: ${extendedMode()}, auto-sync: ${AUTO_SYNC_HOURS ? `every ${AUTO_SYNC_HOURS}h` : 'off'})`));
+app.listen(PORT, () => {
+  const pids = portfolioRows().map((p) => p.id);
+  const keyed = (id) => pids.filter((pid) => portfolioKey(id, pid).key).length;
+  const exchanges = db.prepare("SELECT * FROM wallets WHERE kind = 'evm'").all().filter((w) => walletKey('extended', w).key).length;
+  console.log(`BitBlock DeFi Tracker is running: open http://localhost:${process.env.PUBLIC_PORT || PORT} (portfolios with a key: Zerion ${keyed('zerion')}/${pids.length}, DeBank ${keyed('debank')}/${pids.length}; Extended accounts linked: ${exchanges}; Lighter: ${lighterMode()}; auto-sync: ${AUTO_SYNC_HOURS ? `every ${AUTO_SYNC_HOURS}h` : 'off'})`);
+});

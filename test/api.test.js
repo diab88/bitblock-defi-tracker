@@ -182,28 +182,107 @@ test('portfolios with data cannot be deleted; empty ones can', async () => {
   assert.ok((await ok('GET', '/api/positions', null, 99999)).some((p) => p.protocol === 'A-pos'));
 });
 
+const envText = () => fs.readFileSync(path.join(dir, '.env'), 'utf8');
+const envLine = (prefix) => envText().split('\n').find((l) => l.startsWith(prefix));
+
 test('Data sources: a key saved in the UI goes to .env, applies at once, and is never shown again', async () => {
-  const envFile = path.join(dir, '.env');
-  let st = await ok('GET', '/api/settings');
+  let st = await ok('GET', '/api/settings', null, A);
   assert.equal(st.envFile.writable, true);
   assert.equal(st.sources.find((s) => s.id === 'zerion').configured, false);
-  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'bad key with spaces' })).status, 400);
-  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'zk_test_12345678\nAPP_PASSWORD=x' })).status, 400);
-  assert.equal((await call('PUT', '/api/settings/nope', { key: 'zk_test_12345678' })).status, 404);
-  const r = await ok('PUT', '/api/settings/zerion', { key: 'zk_test_1234abcd', test: false });
+  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'bad key with spaces' }, A)).status, 400);
+  assert.equal((await call('PUT', '/api/settings/zerion', { key: 'zk_test_12345678\nAPP_PASSWORD=x' }, A)).status, 400);
+  assert.equal((await call('PUT', '/api/settings/nope', { key: 'zk_test_12345678' }, A)).status, 404);
+  const r = await ok('PUT', '/api/settings/zerion', { key: 'zk_test_1234abcd', test: false }, A);
   assert.equal(r.masked, '••••abcd');
   assert.equal(r.saved, true);
   assert.equal(r.mode, 'live');                                         // applied without a restart
-  assert.equal((await ok('GET', '/api/meta')).zerion, 'live');
-  const text = fs.readFileSync(envFile, 'utf8');
-  assert.ok(text.includes('ZERION_API_KEY=zk_test_1234abcd'));
-  assert.ok(text.startsWith('# test env\n') && text.includes('ZERION_MOCK=1'));   // rest of .env untouched
-  st = await ok('GET', '/api/settings');
+  assert.equal((await ok('GET', '/api/meta', null, A)).zerion, 'live');
+  assert.match(envLine('ZERION_API_KEY__'), /^ZERION_API_KEY__[0-9A-F]{10}=zk_test_1234abcd$/); // stored for this portfolio
+  assert.ok(!/^ZERION_API_KEY=/m.test(envText().replace('ZERION_API_KEY=\n', '')));            // not as a shared key
+  assert.ok(envText().startsWith('# test env\n') && envText().includes('ZERION_MOCK=1'));        // rest of .env untouched
+  st = await ok('GET', '/api/settings', null, A);
   assert.ok(!JSON.stringify(st).includes('zk_test_1234abcd'));           // never sent back
   assert.equal(st.sources.find((s) => s.id === 'zerion').masked, '••••abcd');
-  await ok('DELETE', '/api/settings/zerion');
-  assert.ok(fs.readFileSync(envFile, 'utf8').includes('ZERION_API_KEY=\n'));
-  assert.equal((await ok('GET', '/api/meta')).zerion, 'mock');           // back to the .env's demo setting
+});
+
+test('Data sources: each portfolio has its own keys; a key in one is never used by another', async () => {
+  // B has no key of its own: it stays on the .env demo setting even though A has a live key.
+  assert.equal((await ok('GET', '/api/meta', null, B)).zerion, 'mock');
+  assert.equal((await ok('GET', '/api/settings', null, B)).sources.find((s) => s.id === 'zerion').configured, false);
+  await ok('PUT', '/api/settings/zerion', { key: 'zk_other_5678wxyz', test: false }, B);
+  assert.equal((await ok('GET', '/api/settings', null, A)).sources.find((s) => s.id === 'zerion').masked, '••••abcd');
+  assert.equal((await ok('GET', '/api/settings', null, B)).sources.find((s) => s.id === 'zerion').masked, '••••wxyz');
+  assert.equal(envText().split('\n').filter((l) => l.startsWith('ZERION_API_KEY__')).length, 2);
+  // Removing A's key leaves B's alone.
+  await ok('DELETE', '/api/settings/zerion', null, A);
+  assert.ok(!envText().includes('zk_test_1234abcd'));
+  assert.equal((await ok('GET', '/api/meta', null, A)).zerion, 'mock');
+  assert.equal((await ok('GET', '/api/meta', null, B)).zerion, 'live');
+  assert.equal((await call('DELETE', '/api/settings/zerion', null, A)).status, 404);              // nothing left to remove
+  await ok('DELETE', '/api/settings/zerion', null, B);
+  assert.ok(!envText().includes('ZERION_API_KEY__'));
+});
+
+test('Exchange accounts are opt-in and linked to one wallet only', async () => {
+  // Nothing by default: no wallet has one, and the portfolio shows Extended as off.
+  assert.equal((await ok('GET', '/api/meta', null, A)).extended, 'off');
+  assert.deepEqual((await ok('GET', '/api/wallets', null, A)).find((w) => w.id === walletA.id).exchanges, {});
+  assert.ok(!/EXTENDED/.test(envText()));
+  assert.equal((await call('POST', `/api/wallets/${walletA.id}/sync?provider=extended`, null, A)).status, 400);
+  // It must name a wallet of this portfolio, and an EVM one.
+  assert.equal((await call('PUT', '/api/settings/extended', { key: 'ext_key_0001aaaa', test: false }, A)).status, 400);
+  assert.equal((await call('PUT', `/api/settings/extended?wallet=${walletsB[0].id}`, { key: 'ext_key_0001aaaa', test: false }, A)).status, 404);
+  assert.equal((await call('PUT', `/api/settings/extended?wallet=${walletsB[2].id}`, { key: 'ext_key_0001aaaa', test: false }, B)).status, 400); // Solana
+  const second = await ok('POST', '/api/wallets', { name: 'Second EVM', address: '0x4444444444444444444444444444444444444444', track_from: 'all' }, A);
+  await ok('PUT', `/api/settings/extended?wallet=${second.id}`, { key: 'ext_key_0001aaaa', test: false }, A);
+  const wallets = await ok('GET', '/api/wallets', null, A);
+  assert.equal(wallets.find((w) => w.id === second.id).exchanges.extended.masked, '••••aaaa');
+  assert.deepEqual(wallets.find((w) => w.id === walletA.id).exchanges, {});                       // not the other wallet
+  assert.ok(wallets.every((w) => !('key_ref' in w)));
+  assert.equal((await ok('GET', '/api/meta', null, A)).extended, 'live');
+  assert.equal((await ok('GET', '/api/meta', null, B)).extended, 'off');                           // not the other portfolio
+  assert.ok((await ok('GET', '/api/wallets', null, B)).every((w) => !Object.keys(w.exchanges).length));
+  assert.match(envLine('EXTENDED_API_KEY__'), /^EXTENDED_API_KEY__[0-9A-F]{10}=ext_key_0001aaaa$/);
+  // Deleting the wallet deletes its key.
+  await ok('DELETE', `/api/wallets/${second.id}`, null, A);
+  assert.ok(!envText().includes('ext_key_0001aaaa'));
+  assert.equal((await ok('GET', '/api/meta', null, A)).extended, 'off');
+});
+
+test('DEX accounts: none by default; added and removed per wallet with "Add DEX account"', async () => {
+  const meta = await ok('GET', '/api/meta', null, B);
+  assert.ok(['lighter', 'extended'].every((id) => meta.dexes.some((d) => d.id === id)));
+  const w = walletsB[0];
+  assert.deepEqual((await ok('GET', '/api/wallets', null, B)).find((x) => x.id === w.id).exchanges, {});   // not even Lighter
+  assert.equal((await call('POST', `/api/wallets/${w.id}/sync?provider=lighter`, null, B)).status, 400);
+  assert.equal((await call('POST', `/api/wallets/${w.id}/dex`, { dex: 'nope' }, B)).status, 404);
+  assert.equal((await call('POST', `/api/wallets/${walletsB[2].id}/dex`, { dex: 'lighter', test: false }, B)).status, 400); // Solana wallet
+  assert.equal((await call('POST', `/api/wallets/${w.id}/dex`, { dex: 'lighter', test: false }, A)).status, 404);           // other portfolio's wallet
+  await ok('POST', `/api/wallets/${w.id}/dex`, { dex: 'lighter', test: false }, B);
+  await ok('POST', `/api/wallets/${w.id}/dex`, { dex: 'extended', key: 'ext_key_0002bbbb', test: false }, B);
+  assert.equal((await call('POST', `/api/wallets/${w.id}/dex`, { dex: 'extended', key: 'bad key' }, B)).status, 400);
+  let ex = (await ok('GET', '/api/wallets', null, B)).find((x) => x.id === w.id).exchanges;
+  assert.deepEqual(Object.keys(ex).sort(), ['extended', 'lighter']);
+  assert.equal(ex.extended.masked, '••••bbbb');
+  assert.ok(!('masked' in ex.lighter));
+  assert.deepEqual((await ok('GET', '/api/wallets', null, B)).find((x) => x.id === walletsB[1].id).exchanges, {}); // other wallet untouched
+  const st = await ok('GET', '/api/settings', null, B);
+  assert.deepEqual(Object.keys(st.wallets.find((x) => x.id === w.id).exchanges).sort(), ['extended', 'lighter']);
+  await ok('DELETE', `/api/wallets/${w.id}/dex/extended`, null, B);
+  await ok('DELETE', `/api/wallets/${w.id}/dex/lighter`, null, B);
+  assert.equal((await call('DELETE', `/api/wallets/${w.id}/dex/lighter`, null, B)).status, 404);
+  assert.deepEqual((await ok('GET', '/api/wallets', null, B)).find((x) => x.id === w.id).exchanges, {});
+  assert.ok(!envText().includes('ext_key_0002bbbb'));
+});
+
+test('Wallet balance lists the tokens in a wallet of this portfolio only', async () => {
+  const r = await ok('GET', `/api/wallets/${walletsB[0].id}/holdings`, null, B);
+  assert.equal(r.mock, true);
+  assert.ok(r.holdings.length > 0 && r.holdings.every((h) => h.symbol && h.chain && h.qty > 0));
+  assert.ok(Math.abs(r.totalUsd - r.holdings.reduce((t, h) => t + h.valueUsd, 0)) < 1e-9);
+  assert.equal((await call('GET', `/api/wallets/${walletsB[0].id}/holdings`, null, A)).status, 404);
+  const sol = await ok('GET', `/api/wallets/${walletsB[2].id}/holdings`, null, B);
+  assert.ok(sol.holdings.some((h) => h.chain === 'Solana'));
 });
 
 test('Data sources: changing keys from another computer is refused without APP_PASSWORD', async () => {

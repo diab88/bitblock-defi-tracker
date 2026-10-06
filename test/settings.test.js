@@ -1,7 +1,7 @@
 // API keys entered in the UI are validated, masked, and written to .env without disturbing anything else.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateKey, updateEnvText, maskKey } from '../server/settings.js';
+import { validateKey, updateEnvText, removeEnvText, maskKey } from '../server/settings.js';
 
 test('keys must be a single plain token', () => {
   assert.equal(validateKey('  zk_dev_abc123DEF456  ').key, 'zk_dev_abc123DEF456'); // trimmed
@@ -25,4 +25,9 @@ test('updating .env replaces one line and keeps comments and other settings', ()
 test('only the last four characters are ever shown', () => {
   assert.equal(maskKey('zk_dev_abcdefgh1a2b'), '••••1a2b');
   assert.equal(maskKey(''), null);
+});
+
+test('deleting a wallet or portfolio removes exactly its key lines', () => {
+  const env = '# keys\nZERION_API_KEY__AAAA=one\nZERION_API_KEY__AAAAB=two\nEXTENDED_API_KEY__CCCC=three\nZERION_MOCK=0\n';
+  assert.equal(removeEnvText(env, ['ZERION_API_KEY__AAAA', 'EXTENDED_API_KEY__CCCC']), '# keys\nZERION_API_KEY__AAAAB=two\nZERION_MOCK=0\n');
 });
