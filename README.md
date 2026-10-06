@@ -65,6 +65,29 @@ This is a single-user app. A multi-tenant SaaS would need real user accounts and
 `POST /api/positions/:id/events|close|reopen` · `GET/POST /api/wallets` · `POST /api/wallets/:id/sync?provider=debank|zerion` · `GET /api/wallets/:id/snapshot` ·
 `GET/PUT /api/prices` · `POST /api/prices/refresh` · `GET /api/export` (JSON) · `GET /api/export.csv` · `POST /api/import`
 
+## Portfolios, rewards, corrections and targets
+
+- **Portfolios:** the sidebar switcher creates, renames and switches portfolios. Each keeps its own wallets,
+  positions, totals, suggestions and sync. A portfolio can mix MetaMask, Phantom, Trust Wallet and watched addresses.
+  *Sync all* syncs only the active portfolio. Market prices are shared.
+- **Rewards:** *Rewards* → **Update total rewards to date** (replaces the total: 112 → 120 shows 120) or
+  **Add one reward payment** (adds to it). Fees stay separate.
+- **Corrections:** ✎ on any Activity entry corrects it in place. Every edit, deletion and restore is kept in
+  *Correction history* and can be undone.
+- **Your target:** the optional *Target annual return* on a position (simple APR). Never defaulted. *vs. target* =
+  simple annualized − target, shown once a position has 30+ days.
+
+### Upgrading an existing install
+
+The first start after upgrading migrates the database automatically. Existing wallets and positions move into a
+**Main portfolio**, and reward entries keep their meaning. Back up first:
+
+```bash
+docker exec defi-tracker node -e "new (require('node:sqlite').DatabaseSync)('/data/tracker.db').exec(\"VACUUM INTO '/data/backup.db'\")"
+```
+
+JSON backups from older versions (`version: 1`) still import, into one portfolio.
+
 ## Keeping secrets and wallet data out of git
 
 - `.env` (API keys), `data/` and any `*.db` (your positions) are git-ignored.

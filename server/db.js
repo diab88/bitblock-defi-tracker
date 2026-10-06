@@ -26,42 +26,67 @@ export const CHAINS = ['Ethereum', 'Arbitrum', 'Base', 'Optimism', 'Polygon', 'S
 export const STRATEGIES = ['Vault', 'Staking', 'V3 Pool', 'V2 Pool', 'Funding Rate', 'LLP', 'Looping',
   'Lending / Supply', 'Lending / Borrow', 'Exposure'];
 
+// Canonical definitions of tables that migrations rebuild (CHECK / UNIQUE changes need a rebuild in SQLite).
+const SCHEMA = {
+  wallets: `CREATE TABLE wallets (
+      id INTEGER PRIMARY KEY,
+      portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+      name TEXT NOT NULL,
+      address TEXT,
+      kind TEXT NOT NULL DEFAULT 'manual',       -- evm | solana | manual
+      source TEXT,                               -- metamask | phantom | trustwallet | address | manual
+      track_from TEXT,                           -- "start tracking from" date; NULL = all history
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (portfolio_id, name)
+    )`,
+  events: `CREATE TABLE events (
+      id INTEGER PRIMARY KEY,
+      position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
+      type TEXT NOT NULL CHECK (type IN ('valuation','withdrawal','reward','reward_total','fee','deposit')),
+      date TEXT NOT NULL,
+      amount REAL NOT NULL,
+      note TEXT,
+      source TEXT NOT NULL DEFAULT 'manual'
+    )`,
+};
+
 export function openDb(file) {
   if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-    CREATE TABLE IF NOT EXISTS wallets (
+    CREATE TABLE IF NOT EXISTS portfolios (
       id INTEGER PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
-      address TEXT,
-      kind TEXT NOT NULL DEFAULT 'manual',       -- evm | solana | manual
-      source TEXT,                               -- metamask | phantom | address | manual
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    ${SCHEMA.wallets.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')};
     CREATE TABLE IF NOT EXISTS positions (
       id INTEGER PRIMARY KEY,
+      portfolio_id INTEGER REFERENCES portfolios(id),
       wallet_id INTEGER REFERENCES wallets(id) ON DELETE SET NULL,
       strategy TEXT, protocol TEXT, chain TEXT, currency TEXT,
       entry_date TEXT, exit_date TEXT,
       deposit REAL,
-      expected_return REAL,                      -- decimal, e.g. 0.08
+      expected_return REAL,                      -- user-entered target, simple annual return as a decimal (0.08 = 8%)
       comments TEXT,
       closed INTEGER NOT NULL DEFAULT 0,
       debank_key TEXT,                           -- link to a DeBank/Zerion portfolio item for auto-valuation (Zerion keys start with 'zerion|')
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    CREATE TABLE IF NOT EXISTS events (
-      id INTEGER PRIMARY KEY,
-      position_id INTEGER NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
-      type TEXT NOT NULL CHECK (type IN ('valuation','withdrawal','reward','fee','deposit')),
-      date TEXT NOT NULL,
-      amount REAL NOT NULL,
-      note TEXT,
-      source TEXT NOT NULL DEFAULT 'manual'
-    );
+    ${SCHEMA.events.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')};
     CREATE INDEX IF NOT EXISTS events_position ON events(position_id);
+    CREATE TABLE IF NOT EXISTS event_revisions (
+      id INTEGER PRIMARY KEY,
+      event_id INTEGER NOT NULL,                 -- not a foreign key: the history survives when the event is deleted
+      position_id INTEGER NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('update','delete','restore')),
+      before TEXT,                               -- JSON of the event before the change
+      after TEXT,                                -- JSON after the change (NULL for a delete)
+      reason TEXT,
+      changed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS event_revisions_position ON event_revisions(position_id);
     CREATE TABLE IF NOT EXISTS prices (
       symbol TEXT PRIMARY KEY,
       usd_price REAL,
@@ -95,29 +120,49 @@ export function openDb(file) {
       items TEXT NOT NULL                        -- JSON array of normalized portfolio items
     );
   `);
-  // Migration: widen CHECK constraints (events: 'deposit' = capital added; suggestions: 'close').
-  // SQLite can't alter a CHECK, so rebuild the table when the old definition is still in place.
-  const widen = (table, needle) => {
-    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql || '';
-    if (!sql || sql.includes(needle)) return;
-    const next = sql.replace(`CREATE TABLE ${table}`, `CREATE TABLE ${table}_new`)
-      .replace("IN ('valuation','withdrawal','reward','fee')", "IN ('valuation','withdrawal','reward','fee','deposit')")
-      .replace("IN ('fee','deposit')", "IN ('fee','deposit','close')");
-    db.exec('PRAGMA foreign_keys = OFF; BEGIN;');
-    db.exec(next);
-    db.exec(`INSERT INTO ${table}_new SELECT * FROM ${table}; DROP TABLE ${table}; ALTER TABLE ${table}_new RENAME TO ${table};`);
-    db.exec('COMMIT; PRAGMA foreign_keys = ON;');
-  };
-  widen('events', "'fee','deposit')");
-  widen('suggestions', "'deposit','close')");
-  db.exec('CREATE INDEX IF NOT EXISTS events_position ON events(position_id)');
 
-  // Migration: wallets gained a "start tracking from" date (NULL = all history).
-  if (!db.prepare('PRAGMA table_info(wallets)').all().some((c) => c.name === 'track_from')) {
-    db.exec('ALTER TABLE wallets ADD COLUMN track_from TEXT');
+  // Every install has at least one portfolio; existing data lands in it.
+  if (!db.prepare('SELECT 1 FROM portfolios LIMIT 1').get()) db.prepare("INSERT INTO portfolios (id, name) VALUES (1, 'Main portfolio')").run();
+  const defaultPortfolio = db.prepare('SELECT MIN(id) id FROM portfolios').get().id;
+
+  // Rebuild a table to its canonical definition, keeping ids and every column both versions share.
+  // (SQLite can't alter CHECK or UNIQUE constraints in place.) Foreign keys are off during the swap so
+  // that dropping the old table doesn't cascade into child tables; the result is checked afterwards.
+  const columns = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+  const rebuild = (table, extra = {}) => {
+    const sql = SCHEMA[table].replace(`CREATE TABLE ${table}`, `CREATE TABLE ${table}_new`);
+    db.exec('PRAGMA foreign_keys = OFF; BEGIN;');
+    try {
+      db.exec(sql);
+      const shared = columns(table).filter((c) => columns(`${table}_new`).includes(c) && !(c in extra));
+      const cols = [...shared, ...Object.keys(extra)];
+      const vals = [...shared, ...Object.values(extra)];
+      db.exec(`INSERT INTO ${table}_new (${cols.join(', ')}) SELECT ${vals.join(', ')} FROM ${table};
+        DROP TABLE ${table}; ALTER TABLE ${table}_new RENAME TO ${table};`);
+      const broken = db.prepare('PRAGMA foreign_key_check').all();
+      if (broken.length) throw new Error(`foreign key check failed after rebuilding ${table}: ${JSON.stringify(broken.slice(0, 3))}`);
+      db.exec('COMMIT;');
+    } catch (e) { db.exec('ROLLBACK;'); throw e; } finally { db.exec('PRAGMA foreign_keys = ON;'); }
+  };
+  const tableSql = (t) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(t)?.sql || '';
+
+  // Migration: wallets belong to a portfolio; names are unique per portfolio (not globally).
+  if (!columns('wallets').includes('portfolio_id')) rebuild('wallets', { portfolio_id: String(defaultPortfolio) });
+  if (!columns('wallets').includes('track_from')) db.exec('ALTER TABLE wallets ADD COLUMN track_from TEXT');
+  // Migration: positions belong to a portfolio (a position needn't have a wallet, so it carries its own).
+  if (!columns('positions').includes('portfolio_id')) db.exec('ALTER TABLE positions ADD COLUMN portfolio_id INTEGER REFERENCES portfolios(id)');
+  db.prepare(`UPDATE positions SET portfolio_id = COALESCE((SELECT w.portfolio_id FROM wallets w WHERE w.id = positions.wallet_id), ?)
+    WHERE portfolio_id IS NULL`).run(defaultPortfolio);
+  // Migration: event types gained 'deposit' (capital added) and 'reward_total' (cumulative rewards to date).
+  if (!tableSql('events').includes("'reward_total'")) rebuild('events');
+  db.exec('CREATE INDEX IF NOT EXISTS events_position ON events(position_id)');
+  // Migration: suggestions gained 'close'.
+  if (!tableSql('suggestions').includes("'close'")) {
+    const sql = tableSql('suggestions').replace("IN ('fee','deposit')", "IN ('fee','deposit','close')");
+    SCHEMA.suggestions = sql; rebuild('suggestions');
   }
   // Migration: snapshots gained a provider column when Zerion was added alongside DeBank.
-  if (!db.prepare('PRAGMA table_info(debank_snapshots)').all().some((c) => c.name === 'provider')) {
+  if (!columns('debank_snapshots').includes('provider')) {
     db.exec("ALTER TABLE debank_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'debank'");
   }
   const seed = db.prepare('INSERT OR IGNORE INTO prices (symbol, usd_price, price_date, coingecko_id) VALUES (?, ?, ?, ?)');

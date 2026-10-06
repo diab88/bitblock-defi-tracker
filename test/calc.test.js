@@ -88,3 +88,42 @@ test('capital moved into a position raises its deposit, not its profit', () => {
   assert.equal(m2.currentValue, 120);
   assert.ok(Math.abs(m2.pnl) < 1e-9);
 });
+
+test('rewards to date: a total replaces, a payment adds, fees stay separate', () => {
+  const p = { ...base, deposit: 1000 };
+  const v = ev('valuation', '2026-02-01', 1000);
+  let m = computePosition(p, [v, ev('reward_total', '2026-02-01', 112)], price);
+  assert.equal(m.rewards, 112);
+  m = computePosition(p, [v, ev('reward_total', '2026-02-01', 112), ev('reward_total', '2026-02-10', 120)], price);
+  assert.equal(m.rewards, 120);                               // 112 → 120 shows 120, not 232
+  assert.equal(m.pnl, 120);
+  m = computePosition(p, [v, ev('reward_total', '2026-02-10', 120), ev('reward', '2026-02-12', 5), ev('fee', '2026-02-12', 3)], price);
+  assert.equal(m.rewards, 125);                               // a single payment after the total adds to it
+  assert.equal(m.fees, 3);
+  assert.equal(m.pnl, 122);
+  // A total recorded later supersedes earlier single payments (the platform's total already includes them).
+  m = computePosition(p, [v, ev('reward', '2026-02-05', 50), ev('reward', '2026-02-06', 60), ev('reward_total', '2026-02-20', 130)], price);
+  assert.equal(m.rewards, 130);
+  // Rewards as of a past date only use entries up to then.
+  assert.equal(stateAt(p, [v, ev('reward_total', '2026-02-10', 120), ev('reward_total', '2026-03-10', 150)], '2026-02-28').rewards, 120);
+});
+
+test('vs. target: never invented, not computed under 30 days, otherwise annualized − target', () => {
+  const p = { ...base, deposit: 1000, entry_date: '2026-01-01' };
+  // No target configured → no comparison, whatever the return.
+  let m = computePosition({ ...p, expected_return: null }, [ev('valuation', '2026-03-02', 1020)], price);
+  assert.deepEqual(m.target, { status: 'none', target: null, gap: null });
+  // 2 days in: 1% over 2 days annualizes to 182.5%. Too early to compare with an annual target.
+  m = computePosition({ ...p, expected_return: 0.08 }, [ev('valuation', '2026-01-03', 1010)], price);
+  assert.equal(m.target.status, 'too-early');
+  assert.equal(m.target.gap, null);
+  assert.equal(m.annualizedReliable, false);
+  // 73 days, +2% → simple annualized 10%; target 8% → +2 points.
+  m = computePosition({ ...p, expected_return: 0.08 }, [ev('valuation', '2026-03-15', 1020)], price);
+  assert.equal(m.duration, 73);
+  assert.ok(Math.abs(m.annualized - 0.10) < 1e-12);
+  assert.equal(m.target.status, 'ok');
+  assert.ok(Math.abs(m.target.gap - 0.02) < 1e-12);
+  // A target of 0 is a real target (not "none").
+  assert.equal(computePosition({ ...p, expected_return: 0 }, [ev('valuation', '2026-03-15', 1020)], price).target.status, 'ok');
+});

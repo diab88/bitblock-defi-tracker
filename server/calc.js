@@ -9,6 +9,18 @@
 //   Total Return   = P/L ÷ Deposit                                           (O)
 //   Annualized     = Total Return × 365 ÷ Duration                           (P)
 //   Duration       = (Exit Date or Valuation Date) − Entry Date              (Q)
+//
+// Rewards can be recorded two ways, and the two combine like valuations and withdrawals:
+//   "reward"        one payment received (adds to the total) — what synced fee collections use
+//   "reward_total"  the total received to date, as shown by the platform (replaces the total)
+//   Rewards to date = latest reward_total + single payments recorded after it.
+// Entering a total of 120 after 112 therefore shows 120, not 232.
+//
+// Target: position.expected_return is the user's own target, a simple annual return (APR, not APY) as a
+// decimal. It is never defaulted. "vs. target" = simple annualized return − target, and is only computed
+// once a position has run MIN_DAYS_FOR_ANNUALIZED days: annualizing a few days of P/L multiplies noise by
+// 365/days (8% over 2 days reads as 1,460%), which says nothing about meeting an annual target.
+export const MIN_DAYS_FOR_ANNUALIZED = 30;
 
 const DAY = 86400000;
 
@@ -25,6 +37,16 @@ function sumType(events, type) {
   return events.reduce((s, e) => (e.type === type ? s + e.amount : s), 0);
 }
 
+// Rewards to date from sorted events: the latest cumulative total, plus single payments after it.
+export function rewardsToDate(sortedEvents) {
+  let total = 0;
+  for (const e of sortedEvents) {
+    if (e.type === 'reward_total') total = e.amount;
+    else if (e.type === 'reward') total += e.amount;
+  }
+  return total;
+}
+
 // Position state using only events up to and including `upTo` (ISO date) — or all events.
 export function stateAt(position, events, upTo = null) {
   const evs = sortEvents(events).filter((e) => !upTo || e.date <= upTo);
@@ -32,7 +54,7 @@ export function stateAt(position, events, upTo = null) {
   evs.forEach((e, i) => { if (e.type === 'valuation') lastVal = i; });
 
   const withdrawals = sumType(evs, 'withdrawal');
-  const rewards = sumType(evs, 'reward');
+  const rewards = rewardsToDate(evs);
   const fees = sumType(evs, 'fee');
   const added = sumType(evs, 'deposit');
   let currentValue = null;
@@ -59,6 +81,7 @@ export function computePosition(position, events, price) {
   }
   const totalReturn = s.pnl !== null ? s.pnl / s.capital : null;
   const annualized = totalReturn !== null && duration ? (totalReturn * 365) / duration : null;
+  const target = vsTarget(annualized, duration, position.expected_return);
 
   // Status / Validation (column R), same precedence as the sheet.
   let status;
@@ -79,12 +102,21 @@ export function computePosition(position, events, price) {
     totalReturn,
     annualized,
     expectedReturn: position.expected_return ?? null,
+    annualizedReliable: duration !== null && duration >= MIN_DAYS_FOR_ANNUALIZED,
+    target, // { status: 'none' | 'too-early' | 'ok', target, gap }
     usdPrice: usd,
     usdPriceDate: price?.price_date ?? null,
     depositUsd: toUsd(s.capital),
     valueUsd: status === 'Open' ? toUsd(s.currentValue) : status === 'Closed' ? 0 : null,
     pnlUsd: counted ? toUsd(s.pnl) : null, // column U
   };
+}
+
+// Compare the simple annualized return with the user's target. Never invents a target.
+export function vsTarget(annualized, duration, target) {
+  if (target === null || target === undefined || Number.isNaN(target)) return { status: 'none', target: null, gap: null };
+  if (annualized === null || duration === null || duration < MIN_DAYS_FOR_ANNUALIZED) return { status: 'too-early', target, gap: null, days: duration };
+  return { status: 'ok', target, gap: annualized - target };
 }
 
 // Per-currency rollup, same as the Overview sheet (native units, no conversion).

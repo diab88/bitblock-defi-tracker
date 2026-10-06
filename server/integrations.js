@@ -272,19 +272,49 @@ export function walletFlow(prev, now) {
   return { flow, priceEffect, significant: Math.abs(flow) >= Math.max(0.5, 0.005 * Math.abs(prev.netUsd)) };
 }
 
-// A tracked pool that disappeared from the source: find the transactions that paid its tokens back to the
-// wallet after its last valuation. Large receipts (≥ 25% of its last value) of the pool's own tokens are
-// the principal coming out; returns the exit date and amount, or null when there's no clear evidence.
-export function detectExit(position, txs) {
-  const inPool = (syms) => syms.length > 0 && syms.every((x) => position.tokens.includes(x));
-  const outs = txs.filter((t) => t.chainId === position.chainId && t.date >= position.lastDate
-    && ['receive', 'withdraw', 'burn'].includes(t.op) && t.in.length
-    && (!t.app || t.app === position.protocol || t.app.startsWith('Uniswap'))
-    && inPool([...new Set(t.in.map((x) => x.symbol))]));
-  const big = outs.map((t) => ({ t, usd: t.in.reduce((a, x) => a + x.usd, 0) })).filter((x) => x.usd >= 0.25 * position.lastValue);
-  if (!big.length) return null;
-  return { date: big.map((x) => x.t.date).sort().at(-1), usd: big.reduce((a, x) => a + x.usd, 0), txIds: big.map((x) => x.t.id), hashes: big.map((x) => x.t.hash) };
+// Tracked pools that disappeared from the source: find the transactions that paid their tokens back to the
+// wallet after their last valuation. Large receipts (≥ 25% of a pool's last value) of a pool's own tokens are
+// its principal coming out. Several pools can close on the same day and share tokens (e.g. USDC in all of
+// them), so receipts are assigned jointly and each transaction counts for at most one pool:
+//   1. a receipt whose tokens fit exactly one closing pool → that pool;
+//   2. a receipt whose token set equals one pool's full token set → that pool;
+//   3. otherwise → the pool whose remaining shortfall (last value − already assigned) it best fills,
+//      if it fits (≤ 125% of the shortfall); else it's left unassigned rather than guessed.
+// An exit is also capped at 150% of the pool's last value; anything bigger is treated as no evidence.
+export function detectExits(pools, txs) {
+  const subset = (syms, pool) => syms.length > 0 && syms.every((x) => pool.tokens.includes(x));
+  const appOk = (t, pool) => !t.app || t.app === pool.protocol || t.app.startsWith('Uniswap');
+  const receipts = txs
+    .filter((t) => ['receive', 'withdraw', 'burn'].includes(t.op) && t.in.length)
+    .map((t) => ({ t, syms: [...new Set(t.in.map((x) => x.symbol))], usd: t.in.reduce((a, x) => a + x.usd, 0) }))
+    .map((r) => ({ ...r, pools: pools.filter((p) => p.chainId === r.t.chainId && r.t.date >= p.lastDate && appOk(r.t, p)
+      && subset(r.syms, p) && r.usd >= 0.25 * p.lastValue) }))
+    .filter((r) => r.pools.length);
+  const got = new Map(pools.map((p) => [p.id, []]));
+  const assign = (r, p) => got.get(p.id).push(r);
+  const pending = [];
+  for (const r of receipts) {
+    const exact = r.pools.filter((p) => p.tokens.length === r.syms.length);
+    if (r.pools.length === 1) assign(r, r.pools[0]);
+    else if (exact.length === 1) assign(r, exact[0]);
+    else pending.push(r);
+  }
+  const shortfall = (p) => p.lastValue - got.get(p.id).reduce((a, r) => a + r.usd, 0);
+  for (const r of pending.sort((x, y) => y.usd - x.usd)) {
+    const fits = r.pools.filter((p) => r.usd <= 1.25 * shortfall(p)).sort((x, y) => Math.abs(shortfall(x) - r.usd) - Math.abs(shortfall(y) - r.usd));
+    if (fits.length) assign(r, fits[0]);
+  }
+  const out = new Map();
+  for (const p of pools) {
+    const rs = got.get(p.id);
+    const usd = rs.reduce((a, r) => a + r.usd, 0);
+    if (!rs.length || usd > 1.5 * p.lastValue) { out.set(p.id, null); continue; }
+    out.set(p.id, { date: rs.map((r) => r.t.date).sort().at(-1), usd, txIds: rs.map((r) => r.t.id), hashes: rs.map((r) => r.t.hash) });
+  }
+  return out;
 }
+
+export const detectExit = (pool, txs) => detectExits([{ id: 0, ...pool }], txs).get(0);
 
 // Recent decoded transactions, newest first (up to `pages` × 100).
 export async function fetchZerionTransactions(address, { pages = 3, chainIds } = {}) {

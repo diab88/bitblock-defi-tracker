@@ -5,7 +5,7 @@ import { openDb, CHAINS, STRATEGIES } from './db.js';
 import { computeExposure, detectHedges, underlying } from './hedges.js';
 import { computePosition, summarizeByCurrency, portfolioSeries, positionSeries } from './calc.js';
 import { fetchCoingeckoHistory } from './integrations.js';
-import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExit, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, isEvmAddress, isSolanaAddress } from './integrations.js';
+import { debankMode, fetchDebankPortfolio, zerionMode, fetchZerionPortfolio, lighterMode, fetchLighterPortfolio, fetchZerionTransactions, matchTransactions, relinkKeys, accountSince, applyTrackFrom, walletFlow, detectExits, extendedMode, fetchExtendedPortfolio, fetchCoingeckoPrices, fetchSolanaBalance, isEvmAddress, isSolanaAddress } from './integrations.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PORT = Number(process.env.PORT || 8080);
@@ -26,6 +26,15 @@ if (process.env.APP_PASSWORD) {
   });
 }
 
+// Active portfolio: every API call is scoped to one (X-Portfolio header or ?portfolio=). Unknown or missing →
+// the first portfolio, so older clients and bookmarks keep working.
+app.use('/api', (req, _res, next) => {
+  const asked = Number(req.get('x-portfolio') || req.query.portfolio);
+  const found = asked ? db.prepare('SELECT id FROM portfolios WHERE id = ?').get(asked) : null;
+  req.pid = found ? found.id : db.prepare('SELECT MIN(id) id FROM portfolios').get().id;
+  next();
+});
+
 app.use(express.static(path.join(root, 'public')));
 app.use('/vendor/chart.js', express.static(path.join(root, 'node_modules/chart.js/dist')));
 
@@ -42,13 +51,14 @@ function priceMap() {
   return Object.fromEntries(db.prepare('SELECT * FROM prices').all().map((p) => [p.symbol, p]));
 }
 
-function loadPositions() {
+function loadPositions(pid) {
   const prices = priceMap();
-  const wallets = Object.fromEntries(db.prepare('SELECT id, name FROM wallets').all().map((w) => [w.id, w.name]));
-  const events = db.prepare('SELECT * FROM events').all();
+  const wallets = Object.fromEntries(db.prepare('SELECT id, name FROM wallets WHERE portfolio_id = ?').all(pid).map((w) => [w.id, w.name]));
+  const events = db.prepare('SELECT e.* FROM events e JOIN positions p ON p.id = e.position_id WHERE p.portfolio_id = ?').all(pid);
+  const revised = new Set(db.prepare('SELECT DISTINCT event_id FROM event_revisions WHERE position_id IN (SELECT id FROM positions WHERE portfolio_id = ?)').all(pid).map((r) => r.event_id));
   const byPos = {};
-  for (const e of events) (byPos[e.position_id] ??= []).push(e);
-  return db.prepare('SELECT * FROM positions ORDER BY closed, entry_date DESC, id DESC').all().map((p) => {
+  for (const e of events) (byPos[e.position_id] ??= []).push(revised.has(e.id) ? { ...e, corrected: true } : e);
+  return db.prepare('SELECT * FROM positions WHERE portfolio_id = ? ORDER BY closed, entry_date DESC, id DESC').all(pid).map((p) => {
     const evs = byPos[p.id] || [];
     return { ...p, wallet: wallets[p.wallet_id] ?? null, events: evs, metrics: computePosition(p, evs, prices[p.currency]) };
   });
@@ -67,8 +77,10 @@ function positionFields(b) {
   return f;
 }
 
+const EVENT_TYPES = ['valuation', 'withdrawal', 'reward', 'reward_total', 'fee', 'deposit'];
+
 function addEvent(positionId, { type, date, amount, note, source = 'manual' }) {
-  if (!['valuation', 'withdrawal', 'reward', 'fee', 'deposit'].includes(type)) throw new HttpError(400, 'invalid event type');
+  if (!EVENT_TYPES.includes(type)) throw new HttpError(400, 'invalid event type');
   if (!isDate(date)) throw new HttpError(400, 'date must be YYYY-MM-DD');
   const a = Number(amount);
   if (!Number.isFinite(a) || a < 0) throw new HttpError(400, 'amount must be a non-negative number');
@@ -76,20 +88,70 @@ function addEvent(positionId, { type, date, amount, note, source = 'manual' }) {
     .run(positionId, type, date, a, text(note), source).lastInsertRowid;
 }
 
-const getPosition = (id) => {
+// With `pid`, anything outside that portfolio is "not found": one portfolio can't read or change another's data.
+const getPosition = (id, pid = null) => {
   const p = db.prepare('SELECT * FROM positions WHERE id = ?').get(id);
-  if (!p) throw new HttpError(404, 'position not found');
+  if (!p || (pid !== null && p.portfolio_id !== pid)) throw new HttpError(404, 'position not found');
   return p;
 };
+const getWallet = (id, pid = null) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(id);
+  if (!w || (pid !== null && w.portfolio_id !== pid)) throw new HttpError(404, 'wallet not found');
+  return w;
+};
+// A position's wallet must be in the same portfolio as the position.
+const checkWalletFor = (walletId, pid) => { if (walletId !== null && walletId !== undefined) getWallet(walletId, pid); };
+
+// ---------- portfolios ----------
+const portfolioRows = () => db.prepare(`SELECT p.id, p.name, p.created_at,
+    (SELECT COUNT(*) FROM wallets w WHERE w.portfolio_id = p.id) wallets,
+    (SELECT COUNT(*) FROM positions x WHERE x.portfolio_id = p.id) positions
+  FROM portfolios p ORDER BY p.id`).all();
+
+app.get('/api/portfolios', (req, res) => res.json({ current: req.pid, portfolios: portfolioRows() }));
+
+app.post('/api/portfolios', (req, res) => {
+  const name = text(req.body.name);
+  if (!name) throw new HttpError(400, 'portfolio name is required');
+  if (name.length > 60) throw new HttpError(400, 'portfolio name is too long (max 60)');
+  try {
+    const id = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run(name).lastInsertRowid);
+    res.status(201).json(portfolioRows().find((p) => p.id === id));
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a portfolio with that name already exists');
+    throw e;
+  }
+});
+
+app.put('/api/portfolios/:id', (req, res) => {
+  const name = text(req.body.name);
+  if (!name) throw new HttpError(400, 'portfolio name is required');
+  if (!db.prepare('SELECT 1 FROM portfolios WHERE id = ?').get(req.params.id)) throw new HttpError(404, 'portfolio not found');
+  try { db.prepare('UPDATE portfolios SET name = ? WHERE id = ?').run(name, req.params.id); }
+  catch (e) { if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a portfolio with that name already exists'); throw e; }
+  res.json({ ok: true });
+});
+
+// Deleting is only allowed for an empty portfolio (and never the last one), so nothing is lost by accident.
+app.delete('/api/portfolios/:id', (req, res) => {
+  const p = portfolioRows().find((x) => x.id === Number(req.params.id));
+  if (!p) throw new HttpError(404, 'portfolio not found');
+  if (portfolioRows().length === 1) throw new HttpError(400, 'you need at least one portfolio');
+  if (p.wallets || p.positions) throw new HttpError(400, `“${p.name}” still has ${p.wallets} wallet(s) and ${p.positions} position(s); remove or move them first`);
+  db.prepare('DELETE FROM portfolios WHERE id = ?').run(p.id);
+  res.json({ ok: true });
+});
 
 // ---------- meta ----------
-app.get('/api/meta', (_req, res) => {
+app.get('/api/meta', (req, res) => {
   res.json({
+    portfolio: portfolioRows().find((p) => p.id === req.pid),
+    portfolios: portfolioRows(),
     chains: CHAINS,
     strategies: STRATEGIES,
     currencies: db.prepare('SELECT symbol FROM prices ORDER BY rowid').all().map((r) => r.symbol),
-    wallets: db.prepare('SELECT * FROM wallets ORDER BY name').all(),
-    protocols: db.prepare('SELECT DISTINCT protocol FROM positions WHERE protocol IS NOT NULL ORDER BY protocol').all().map((r) => r.protocol),
+    wallets: db.prepare('SELECT * FROM wallets WHERE portfolio_id = ? ORDER BY name').all(req.pid),
+    protocols: db.prepare('SELECT DISTINCT protocol FROM positions WHERE protocol IS NOT NULL AND portfolio_id = ? ORDER BY protocol').all(req.pid).map((r) => r.protocol),
     debank: debankMode(),
     zerion: zerionMode(),
     lighter: lighterMode(),
@@ -101,7 +163,7 @@ app.get('/api/meta', (_req, res) => {
 // ---------- positions ----------
 // Positions plus, for synced ones, what the source reports inside them (e.g. an exchange account's
 // P/L breakdown), so a single account row can be read part by part.
-app.get('/api/positions', (_req, res) => res.json(loadPositions().map((p) => {
+app.get('/api/positions', (req, res) => res.json(loadPositions(req.pid).map((p) => {
   if (!p.debank_key || !p.wallet_id) return p;
   const item = accountSince(latestSnapshotItem(p.wallet_id, p.debank_key), p.entry_date, historicalPrices(p.entry_date));
   if (!item?.breakdown) return p;
@@ -112,8 +174,9 @@ app.get('/api/positions', (_req, res) => res.json(loadPositions().map((p) => {
 
 app.post('/api/positions', (req, res) => {
   const f = positionFields(req.body);
-  const id = db.prepare(`INSERT INTO positions (wallet_id, strategy, protocol, chain, currency, entry_date, exit_date, deposit, expected_return, comments, debank_key)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(f.wallet_id, f.strategy, f.protocol, f.chain, f.currency, f.entry_date, f.exit_date, f.deposit, f.expected_return, f.comments, f.debank_key).lastInsertRowid;
+  checkWalletFor(f.wallet_id, req.pid);
+  const id = db.prepare(`INSERT INTO positions (portfolio_id, wallet_id, strategy, protocol, chain, currency, entry_date, exit_date, deposit, expected_return, comments, debank_key)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(req.pid, f.wallet_id, f.strategy, f.protocol, f.chain, f.currency, f.entry_date, f.exit_date, f.deposit, f.expected_return, f.comments, f.debank_key).lastInsertRowid;
   const cv = num(req.body.current_value);
   const vd = text(req.body.valuation_date) || f.entry_date || today();
   if (cv !== null) addEvent(id, { type: 'valuation', date: vd, amount: cv, source: f.debank_key ? keyProvider(f.debank_key) : 'manual' });
@@ -122,37 +185,109 @@ app.post('/api/positions', (req, res) => {
 });
 
 app.put('/api/positions/:id', (req, res) => {
-  const p = getPosition(req.params.id);
+  const p = getPosition(req.params.id, req.pid);
   const f = positionFields({ ...p, ...req.body });
+  checkWalletFor(f.wallet_id, req.pid);
   db.prepare(`UPDATE positions SET wallet_id=?, strategy=?, protocol=?, chain=?, currency=?, entry_date=?, exit_date=?, deposit=?, expected_return=?, comments=?, debank_key=? WHERE id=?`)
     .run(f.wallet_id, f.strategy, f.protocol, f.chain, f.currency, f.entry_date, f.exit_date, f.deposit, f.expected_return, f.comments, f.debank_key, p.id);
   res.json({ ok: true });
 });
 
 app.delete('/api/positions/:id', (req, res) => {
-  db.prepare('DELETE FROM positions WHERE id = ?').run(getPosition(req.params.id).id);
+  db.prepare('DELETE FROM positions WHERE id = ?').run(getPosition(req.params.id, req.pid).id);
   res.json({ ok: true });
 });
 
 app.get('/api/positions/:id/series', (req, res) => {
-  const p = getPosition(req.params.id);
+  const p = getPosition(req.params.id, req.pid);
   res.json(positionSeries(p, db.prepare('SELECT * FROM events WHERE position_id = ?').all(p.id)));
 });
 
 app.post('/api/positions/:id/events', (req, res) => {
-  const p = getPosition(req.params.id);
+  const p = getPosition(req.params.id, req.pid);
   res.status(201).json({ id: Number(addEvent(p.id, req.body)) });
 });
 
+// ---------- corrections ----------
+// Entries are edited in place (no delete-and-recreate), and every change is kept in event_revisions with
+// the values before and after, so a correction can be reviewed and undone. Calculations always read the
+// current events, so a corrected amount flows through P/L, returns and charts immediately.
+const getEvent = (id, pid) => {
+  const e = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+  if (!e) throw new HttpError(404, 'entry not found');
+  getPosition(e.position_id, pid);
+  return e;
+};
+const snapshotOf = (e) => ({ id: e.id, type: e.type, date: e.date, amount: e.amount, note: e.note, source: e.source });
+const logRevision = (e, action, before, after, reason) => db.prepare('INSERT INTO event_revisions (event_id, position_id, action, before, after, reason) VALUES (?, ?, ?, ?, ?, ?)')
+  .run(e.id, e.position_id, action, before ? JSON.stringify(before) : null, after ? JSON.stringify(after) : null, text(reason));
+
+function updateEvent(e, b, action = 'update') {
+  const next = { ...e,
+    type: b.type ?? e.type,
+    date: b.date ?? e.date,
+    amount: b.amount === undefined ? e.amount : Number(b.amount),
+    note: b.note === undefined ? e.note : text(b.note) };
+  if (!EVENT_TYPES.includes(next.type)) throw new HttpError(400, 'invalid event type');
+  // Only swaps within the same family are allowed: a correction mustn't turn a fee into a valuation.
+  const family = (t) => (t === 'reward' || t === 'reward_total' ? 'reward' : t);
+  if (family(next.type) !== family(e.type)) throw new HttpError(400, `can't change a ${e.type} entry into ${next.type}`);
+  if (!isDate(next.date)) throw new HttpError(400, 'date must be YYYY-MM-DD');
+  if (!Number.isFinite(next.amount) || next.amount < 0) throw new HttpError(400, 'amount must be a non-negative number');
+  const before = snapshotOf(e), after = snapshotOf(next);
+  if (JSON.stringify(before) === JSON.stringify(after)) return { changed: false };
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE events SET type = ?, date = ?, amount = ?, note = ? WHERE id = ?').run(next.type, next.date, next.amount, next.note, e.id);
+    logRevision(e, action, before, after, b.reason);
+    db.exec('COMMIT');
+  } catch (err) { db.exec('ROLLBACK'); throw err; }
+  return { changed: true, before, after };
+}
+
+app.put('/api/events/:id', (req, res) => res.json(updateEvent(getEvent(req.params.id, req.pid), req.body)));
+
 app.delete('/api/events/:id', (req, res) => {
-  db.prepare("UPDATE suggestions SET status = 'pending', event_id = NULL WHERE event_id = ?").run(req.params.id);
-  db.prepare('DELETE FROM events WHERE id = ?').run(req.params.id);
+  const e = getEvent(req.params.id, req.pid);
+  const sg = db.prepare('SELECT id FROM suggestions WHERE event_id = ?').get(e.id);
+  db.exec('BEGIN');
+  try {
+    logRevision(e, 'delete', { ...snapshotOf(e), suggestionId: sg?.id ?? null }, null, req.query.reason || req.body?.reason);
+    db.prepare("UPDATE suggestions SET status = 'pending', event_id = NULL WHERE event_id = ?").run(e.id);
+    db.prepare('DELETE FROM events WHERE id = ?').run(e.id);
+    db.exec('COMMIT');
+  } catch (err) { db.exec('ROLLBACK'); throw err; }
   res.json({ ok: true });
+});
+
+app.get('/api/positions/:id/revisions', (req, res) => {
+  const p = getPosition(req.params.id, req.pid);
+  res.json(db.prepare('SELECT * FROM event_revisions WHERE position_id = ? ORDER BY id DESC').all(p.id)
+    .map((r) => ({ ...r, before: r.before ? JSON.parse(r.before) : null, after: r.after ? JSON.parse(r.after) : null })));
+});
+
+// Undo a change: put the entry back the way it was before that revision (re-creating it if it was deleted).
+app.post('/api/revisions/:id/restore', (req, res) => {
+  const r = db.prepare('SELECT * FROM event_revisions WHERE id = ?').get(req.params.id);
+  if (!r?.before) throw new HttpError(404, 'nothing to restore');
+  const p = getPosition(r.position_id, req.pid);
+  const before = JSON.parse(r.before);
+  const current = db.prepare('SELECT * FROM events WHERE id = ?').get(r.event_id);
+  if (current) return res.json(updateEvent(current, { ...before, reason: `restored revision #${r.id}` }, 'restore'));
+  db.exec('BEGIN');
+  try {
+    db.prepare('INSERT INTO events (id, position_id, type, date, amount, note, source) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(before.id, p.id, before.type, before.date, before.amount, before.note, before.source || 'manual');
+    if (before.suggestionId) db.prepare("UPDATE suggestions SET status = 'applied', event_id = ? WHERE id = ? AND status = 'pending'").run(before.id, before.suggestionId);
+    logRevision({ id: before.id, position_id: p.id }, 'restore', null, before, `restored revision #${r.id}`);
+    db.exec('COMMIT');
+  } catch (err) { db.exec('ROLLBACK'); throw err; }
+  res.json({ changed: true, restored: before });
 });
 
 // Close = final valuation at the exit date (exit proceeds) + mark closed. Mirrors sheet column X + G.
 app.post('/api/positions/:id/close', (req, res) => {
-  const p = getPosition(req.params.id);
+  const p = getPosition(req.params.id, req.pid);
   const { exit_date, exit_value } = req.body;
   if (!isDate(exit_date)) throw new HttpError(400, 'exit_date must be YYYY-MM-DD');
   if (p.entry_date && exit_date < p.entry_date) throw new HttpError(400, 'exit date is before entry date');
@@ -162,14 +297,14 @@ app.post('/api/positions/:id/close', (req, res) => {
 });
 
 app.post('/api/positions/:id/reopen', (req, res) => {
-  db.prepare('UPDATE positions SET closed = 0, exit_date = NULL WHERE id = ?').run(getPosition(req.params.id).id);
+  db.prepare('UPDATE positions SET closed = 0, exit_date = NULL WHERE id = ?').run(getPosition(req.params.id, req.pid).id);
   res.json({ ok: true });
 });
 
 // ---------- dashboard ----------
 app.get('/api/dashboard', (req, res) => {
   const { wallet, currency, status } = req.query;
-  let rows = loadPositions();
+  let rows = loadPositions(req.pid);
   if (wallet === 'none') rows = rows.filter((r) => !r.wallet_id);
   else if (wallet) rows = rows.filter((r) => String(r.wallet_id) === wallet);
   if (currency) rows = rows.filter((r) => r.currency === currency);
@@ -199,7 +334,8 @@ app.get('/api/dashboard', (req, res) => {
   kpis.pnlUsd = kpis.pnlOpenUsd + kpis.pnlClosedUsd;
   kpis.totalReturn = kpis.depositedUsd ? kpis.pnlUsd / kpis.depositedUsd : null;
   // Deposit-weighted simple annualized return, matching the sheet's per-row definition.
-  const w = priced.filter((r) => r.metrics.annualized !== null);
+  // Only positions held long enough for an annual figure to mean something (see MIN_DAYS_FOR_ANNUALIZED).
+  const w = priced.filter((r) => r.metrics.annualized !== null && r.metrics.annualizedReliable);
   kpis.weightedApr = sum(w, (r) => r.metrics.depositUsd) ? sum(w, (r) => r.metrics.annualized * r.metrics.depositUsd) / sum(w, (r) => r.metrics.depositUsd) : null;
 
   const group = (key) => {
@@ -253,7 +389,7 @@ app.get('/api/dashboard', (req, res) => {
 
   res.json({
     kpis,
-    untracked: currency && currency !== 'USD' ? [] : untrackedHoldings(wallet).map((u) => ({ ...u, items: u.items.map(({ base, ...i }) => i) })),
+    untracked: currency && currency !== 'USD' ? [] : untrackedHoldings(req.pid, wallet).map((u) => ({ ...u, items: u.items.map(({ base, ...i }) => i) })),
     series: portfolioSeries(counted),
     byStrategy: group('strategy'),
     byChain: group('chain'),
@@ -267,8 +403,8 @@ app.get('/api/dashboard', (req, res) => {
 });
 
 // ---------- wallets ----------
-app.get('/api/wallets', (_req, res) => {
-  const wallets = db.prepare('SELECT * FROM wallets ORDER BY name').all();
+app.get('/api/wallets', (req, res) => {
+  const wallets = db.prepare('SELECT * FROM wallets WHERE portfolio_id = ? ORDER BY name').all(req.pid);
   const snap = db.prepare('SELECT provider, fetched_at, total_usd FROM debank_snapshots WHERE wallet_id = ? ORDER BY id DESC LIMIT 1');
   const count = db.prepare('SELECT COUNT(*) n FROM positions WHERE wallet_id = ?');
   res.json(wallets.map((w) => ({ ...w, positions: count.get(w.id).n, lastSync: snap.get(w.id) ?? null })));
@@ -283,18 +419,25 @@ app.post('/api/wallets', (req, res) => {
     if (isEvmAddress(address)) kind = 'evm';
     else if (isSolanaAddress(address)) kind = 'solana';
     else throw new HttpError(400, 'address is neither a valid EVM (0x…) nor Solana address');
-    const existing = db.prepare('SELECT * FROM wallets WHERE lower(address) = lower(?)').get(address);
+    // The same address may be tracked in several portfolios (each keeps its own positions); within one
+    // portfolio it's added once.
+    const existing = db.prepare('SELECT * FROM wallets WHERE lower(address) = lower(?) AND portfolio_id = ?').get(address, req.pid);
     if (existing) return res.json(existing);
   }
   const trackFrom = parseTrackFrom(req.body.track_from ?? 'today');
   try {
-    const id = db.prepare('INSERT INTO wallets (name, address, kind, source, track_from) VALUES (?, ?, ?, ?, ?)').run(name, address, kind, text(req.body.source) || (address ? 'address' : 'manual'), trackFrom).lastInsertRowid;
+    const source = text(req.body.source) || (address ? 'address' : 'manual');
+    if (!WALLET_SOURCES.includes(source)) throw new HttpError(400, `unknown wallet source "${source}"`);
+    const id = db.prepare('INSERT INTO wallets (portfolio_id, name, address, kind, source, track_from) VALUES (?, ?, ?, ?, ?, ?)').run(req.pid, name, address, kind, source, trackFrom).lastInsertRowid;
     res.status(201).json(db.prepare('SELECT * FROM wallets WHERE id = ?').get(id));
   } catch (e) {
-    if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a wallet with that name already exists');
+    if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a wallet with that name already exists in this portfolio');
     throw e;
   }
 });
+
+// How a wallet was connected. A portfolio can mix any of these.
+const WALLET_SOURCES = ['metamask', 'phantom', 'trustwallet', 'address', 'manual'];
 
 // "today" → today's date, "all"/empty → NULL (all history), or an explicit YYYY-MM-DD not in the future.
 function parseTrackFrom(v) {
@@ -306,23 +449,22 @@ function parseTrackFrom(v) {
 }
 
 app.put('/api/wallets/:id', (req, res) => {
-  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
-  if (!w) throw new HttpError(404, 'wallet not found');
+  const w = getWallet(req.params.id, req.pid);
   const name = req.body.name === undefined ? w.name : text(req.body.name);
   if (!name) throw new HttpError(400, 'wallet name is required');
   const trackFrom = req.body.track_from === undefined ? w.track_from : parseTrackFrom(req.body.track_from);
-  db.prepare('UPDATE wallets SET name = ?, track_from = ? WHERE id = ?').run(name, trackFrom, w.id);
+  try { db.prepare('UPDATE wallets SET name = ?, track_from = ? WHERE id = ?').run(name, trackFrom, w.id); }
+  catch (e) { if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'a wallet with that name already exists in this portfolio'); throw e; }
   res.json({ ok: true, track_from: trackFrom });
 });
 
 app.delete('/api/wallets/:id', (req, res) => {
-  db.prepare('DELETE FROM wallets WHERE id = ?').run(req.params.id);
+  db.prepare('DELETE FROM wallets WHERE id = ?').run(getWallet(req.params.id, req.pid).id);
   res.json({ ok: true });
 });
 
 app.get('/api/wallets/:id/balance', wrap(async (req, res) => {
-  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
-  if (!w) throw new HttpError(404, 'wallet not found');
+  const w = getWallet(req.params.id, req.pid);
   if (w.kind !== 'solana') throw new HttpError(400, 'native balance lookup on the server is only for Solana wallets');
   res.json({ symbol: 'SOL', balance: await fetchSolanaBalance(w.address) });
 }));
@@ -405,6 +547,7 @@ function snapshotView(s, walletId) {
 
 // Latest snapshot for the wallet (from whichever source synced last), or for one provider.
 app.get('/api/wallets/:id/snapshot', (req, res) => {
+  getWallet(req.params.id, req.pid);
   const p = req.query.provider;
   const s = p
     ? db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1').get(req.params.id, p)
@@ -515,8 +658,9 @@ async function closeVanished(w, items, byKey) {
   if (!pools.length) return [];
   const txs = await fetchZerionTransactions(w.address, { pages: 1, chainIds: [...new Set(pools.map((x) => x.chainId))] });
   const out = [];
+  const exits = detectExits(pools, txs); // jointly: one transaction never pays out two pools
   for (const pool of pools) {
-    const exit = detectExit(pool, txs);
+    const exit = exits.get(pool.id);
     if (exit) {
       db.exec('BEGIN');
       try {
@@ -560,7 +704,7 @@ function rebuildWalletFlows(position) {
 }
 
 app.post('/api/positions/:id/rebuild-transfers', (req, res) => {
-  const p = getPosition(req.params.id);
+  const p = getPosition(req.params.id, req.pid);
   if (!p.debank_key?.includes('|Wallet|')) throw new HttpError(400, 'only wallet-balance positions have transfers to rebuild');
   res.json({ transfers: rebuildWalletFlows(p) });
 });
@@ -593,16 +737,15 @@ async function scanActivity(w) {
 }
 
 app.post('/api/wallets/:id/scan-activity', wrap(async (req, res) => {
-  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
-  if (!w) throw new HttpError(404, 'wallet not found');
+  const w = getWallet(req.params.id, req.pid);
   if (zerionMode() !== 'live') throw new HttpError(400, 'Scanning transactions needs ZERION_API_KEY.');
   res.json({ suggested: await scanActivity(w) });
 }));
 
 app.get('/api/suggestions', (req, res) => {
   const rows = db.prepare(`SELECT s.*, p.protocol, p.chain, p.deposit, p.entry_date, p.comments FROM suggestions s JOIN positions p ON p.id = s.position_id
-    WHERE s.status = ? ${req.query.position ? 'AND s.position_id = ?' : ''} ORDER BY s.date DESC, s.id DESC`)
-    .all(...[req.query.status || 'pending', ...(req.query.position ? [req.query.position] : [])]);
+    WHERE s.status = ? AND p.portfolio_id = ? ${req.query.position ? 'AND s.position_id = ?' : ''} ORDER BY s.date DESC, s.id DESC`)
+    .all(...[req.query.status || 'pending', req.pid, ...(req.query.position ? [req.query.position] : [])]);
   res.json(rows.map((r) => ({ ...r, detail: JSON.parse(r.detail || '{}') })));
 });
 
@@ -611,6 +754,7 @@ app.get('/api/suggestions', (req, res) => {
 app.post('/api/suggestions/:id/apply', (req, res) => {
   const sg = db.prepare("SELECT * FROM suggestions WHERE id = ? AND status = 'pending'").get(req.params.id);
   if (!sg) throw new HttpError(404, 'suggestion not found or already handled');
+  getPosition(sg.position_id, req.pid);
   db.exec('BEGIN');
   try {
     if (sg.kind === 'close') {
@@ -636,13 +780,16 @@ app.post('/api/suggestions/:id/apply', (req, res) => {
 });
 
 app.post('/api/suggestions/:id/ignore', (req, res) => {
+  const sg = db.prepare('SELECT position_id FROM suggestions WHERE id = ?').get(req.params.id);
+  if (!sg) throw new HttpError(404, 'suggestion not found');
+  getPosition(sg.position_id, req.pid);
   db.prepare("UPDATE suggestions SET status = 'ignored' WHERE id = ? AND status = 'pending'").run(req.params.id);
   res.json({ ok: true });
 });
 
 // Latest snapshot per wallet and source, reduced to the items not yet tracked as positions.
-function untrackedHoldings(walletFilter, providerFilter) {
-  const wallets = db.prepare('SELECT id, name FROM wallets').all();
+function untrackedHoldings(pid, walletFilter, providerFilter) {
+  const wallets = db.prepare('SELECT id, name FROM wallets WHERE portfolio_id = ?').all(pid);
   const latest = db.prepare('SELECT * FROM debank_snapshots WHERE wallet_id = ? AND provider = ? ORDER BY id DESC LIMIT 1');
   const out = [];
   for (const w of wallets) {
@@ -667,12 +814,11 @@ const positionLabel = (i) => {
 // Track every untracked item from the wallet's latest sync(s). Uses the deposit and entry date the source
 // reports (Lighter, Extended); otherwise the deposit is today's value, so profit is measured from today.
 app.post('/api/wallets/:id/track-all', (req, res) => {
-  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(req.params.id);
-  if (!w) throw new HttpError(404, 'wallet not found');
-  const holdings = untrackedHoldings(w.id, text(req.query.provider));
+  const w = getWallet(req.params.id, req.pid);
+  const holdings = untrackedHoldings(w.portfolio_id, w.id, text(req.query.provider));
   const d = today();
-  const ins = db.prepare(`INSERT INTO positions (wallet_id, strategy, protocol, chain, currency, entry_date, deposit, comments, debank_key)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const ins = db.prepare(`INSERT INTO positions (portfolio_id, wallet_id, strategy, protocol, chain, currency, entry_date, deposit, comments, debank_key)
+    VALUES (${w.portfolio_id}, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   let created = 0;
   const r2 = (x) => Math.round(x * 1e6) / 1e6;
   db.exec('BEGIN');
@@ -740,10 +886,10 @@ function hedgeReport(rows) {
   return { exposure: exposure.map(({ legs, ...a }) => ({ ...a, legs: legs.map(({ perp, ...l }) => l) })), hedges };
 }
 
-app.get('/api/hedges', (_req, res) => res.json(hedgeReport(loadPositions())));
+app.get('/api/hedges', (req, res) => res.json(hedgeReport(loadPositions(req.pid))));
 
-app.post('/api/wallets/:id/sync', wrap(async (req, res) => res.json(await syncWallet(req.params.id, req.query.provider || req.body?.provider))));
-app.post('/api/wallets/:id/debank-sync', wrap(async (req, res) => res.json(await syncWallet(req.params.id, 'debank'))));
+app.post('/api/wallets/:id/sync', wrap(async (req, res) => res.json(await syncWallet(getWallet(req.params.id, req.pid).id, req.query.provider || req.body?.provider))));
+app.post('/api/wallets/:id/debank-sync', wrap(async (req, res) => res.json(await syncWallet(getWallet(req.params.id, req.pid).id, 'debank'))));
 
 // ---------- prices ----------
 app.get('/api/prices', (_req, res) => res.json(db.prepare('SELECT * FROM prices ORDER BY rowid').all()));
@@ -785,11 +931,14 @@ async function refreshPrices() {
 app.post('/api/prices/refresh', wrap(async (_req, res) => res.json(await refreshPrices())));
 
 // ---------- backup ----------
+// Full backup of every portfolio (version 2 adds portfolios and correction history; version 1 files still import).
 app.get('/api/export', (_req, res) => {
   res.set('Content-Disposition', `attachment; filename="defi-tracker-${today()}.json"`);
   res.json({
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
+    portfolios: db.prepare('SELECT * FROM portfolios').all(),
+    event_revisions: db.prepare('SELECT * FROM event_revisions').all(),
     wallets: db.prepare('SELECT * FROM wallets').all(),
     positions: db.prepare('SELECT * FROM positions').all(),
     events: db.prepare('SELECT * FROM events').all(),
@@ -798,10 +947,10 @@ app.get('/api/export', (_req, res) => {
 });
 
 const csvCell = (v) => (v === null || v === undefined ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-app.get('/api/export.csv', (_req, res) => {
+app.get('/api/export.csv', (req, res) => {
   const cols = ['Wallet', 'Strategy', 'Protocol', 'Chain', 'Currency', 'Entry Date', 'Exit Date', 'Valuation Date', 'Deposit', 'Current Value', 'Distributed Rewards', 'Additional Fees', 'Expected Annual Return', 'Profit / Loss', 'Total Return', 'Annualized Return', 'Duration (Days)', 'Status', 'Comments', 'USD Price', 'Profit / Loss USD', 'USD Price Date', 'Withdrawal'];
   const lines = [cols.join(',')];
-  for (const p of loadPositions()) {
+  for (const p of loadPositions(req.pid)) {
     const m = p.metrics;
     lines.push([p.wallet, p.strategy, p.protocol, p.chain, p.currency, p.entry_date, p.exit_date, m.valuationDate, p.deposit, m.currentValue, m.rewards, m.fees, p.expected_return, m.pnl, m.totalReturn, m.annualized, m.duration, m.status, p.comments, m.usdPrice, m.pnlUsd, m.usdPriceDate, m.withdrawals].map(csvCell).join(','));
   }
@@ -810,10 +959,10 @@ app.get('/api/export.csv', (_req, res) => {
 
 app.post('/api/import', (req, res) => {
   const b = req.body;
-  if (b?.version !== 1 || !Array.isArray(b.positions)) throw new HttpError(400, 'not a BitBlock DeFi Tracker export file');
+  if (![1, 2].includes(b?.version) || !Array.isArray(b.positions)) throw new HttpError(400, 'not a BitBlock DeFi Tracker export file');
   db.exec('BEGIN');
   try {
-    db.exec('DELETE FROM suggestions; DELETE FROM events; DELETE FROM positions; DELETE FROM debank_snapshots; DELETE FROM wallets;');
+    db.exec('DELETE FROM suggestions; DELETE FROM event_revisions; DELETE FROM events; DELETE FROM positions; DELETE FROM debank_snapshots; DELETE FROM wallets; DELETE FROM portfolios;');
     const ins = (table, rows) => {
       const allowed = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
       for (const r of rows || []) {
@@ -821,20 +970,28 @@ app.post('/api/import', (req, res) => {
         db.prepare(`INSERT OR REPLACE INTO ${table} (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(...keys.map((k) => r[k]));
       }
     };
-    ins('wallets', b.wallets); ins('positions', b.positions); ins('events', b.events); ins('prices', b.prices);
+    // Version 1 backups predate portfolios: everything goes into one "Main portfolio".
+    ins('portfolios', b.portfolios?.length ? b.portfolios : [{ id: 1, name: 'Main portfolio' }]);
+    const pid1 = db.prepare('SELECT MIN(id) id FROM portfolios').get().id;
+    ins('wallets', (b.wallets || []).map((w) => ({ portfolio_id: pid1, ...w })));
+    ins('positions', (b.positions || []).map((x) => ({ portfolio_id: (b.wallets || []).find((w) => w.id === x.wallet_id)?.portfolio_id ?? pid1, ...x })));
+    ins('events', b.events); ins('prices', b.prices); ins('event_revisions', b.event_revisions);
     db.exec('COMMIT');
   } catch (e) { db.exec('ROLLBACK'); throw new HttpError(400, `import failed: ${e.message}`); }
   res.json({ ok: true, positions: b.positions.length });
 });
 
 // Background sync so every tracked position gets a fresh valuation (a new chart point) without clicking.
-let syncing = null;
-async function syncAll(trigger = 'auto') {
+// "Sync all" from the UI syncs the current portfolio's wallets only; the background sync covers every
+// portfolio. Each wallet sync writes only to that wallet's own positions, snapshots and suggestions, so one
+// portfolio's sync never changes another's records. (Market prices are shared: one LIT price for everyone.)
+const syncing = new Map();
+async function syncAll(trigger = 'auto', pid = null) {
   const results = [];
-  const wallets = db.prepare("SELECT * FROM wallets WHERE address IS NOT NULL AND kind != 'manual'").all();
+  const wallets = db.prepare(`SELECT * FROM wallets WHERE address IS NOT NULL AND kind != 'manual' ${pid ? 'AND portfolio_id = ?' : ''}`).all(...(pid ? [pid] : []));
   for (const w of wallets) {
     for (const [id, src] of Object.entries(PROVIDERS)) {
-      if (src.mode() !== 'live' || !src.kinds.includes(w.kind) || (src.allows && !src.allows(w))) continue;
+      if (src.mode() === 'off' || !src.kinds.includes(w.kind) || (src.allows && !src.allows(w))) continue;
       try {
         const r = await syncWallet(w.id, id);
         results.push({ wallet: w.name, source: src.label, ok: true, items: r.items.length, updated: r.updated.length, suggested: r.suggested || 0, closedList: r.closed || [] });
@@ -845,20 +1002,25 @@ async function syncAll(trigger = 'auto') {
       }
     }
   }
-  lastSyncAt = new Date().toISOString();
+  const at = new Date().toISOString();
+  for (const id of pid ? [pid] : portfolioRows().map((p) => p.id)) lastSyncAt.set(id, at);
   return results;
 }
-let lastSyncAt = null;
-// Runs one sync at a time; a second click while one is running waits for the same run.
-const runSync = (trigger) => (syncing ??= syncAll(trigger).finally(() => { syncing = null; }));
+const lastSyncAt = new Map();
+// One sync per portfolio at a time; a second click while one is running waits for the same run.
+const runSync = (trigger, pid = null) => {
+  const k = pid ?? 'all';
+  if (!syncing.has(k)) syncing.set(k, syncAll(trigger, pid).finally(() => syncing.delete(k)));
+  return syncing.get(k);
+};
 const autoSync = async () => { await refreshPrices().catch((e) => console.warn(`price refresh failed: ${e.message}`)); return runSync('auto'); };
 
-app.post('/api/sync-all', wrap(async (_req, res) => {
+app.post('/api/sync-all', wrap(async (req, res) => {
   const prices = await refreshPrices().catch(() => null);
-  const results = await runSync('manual');
-  res.json({ results, prices, lastSyncAt });
+  const results = await runSync('manual', req.pid);
+  res.json({ results, prices, lastSyncAt: lastSyncAt.get(req.pid) ?? null, portfolio: req.pid });
 }));
-app.get('/api/sync-status', (_req, res) => res.json({ lastSyncAt, running: !!syncing }));
+app.get('/api/sync-status', (req, res) => res.json({ lastSyncAt: lastSyncAt.get(req.pid) ?? null, running: syncing.has(req.pid) || syncing.has('all') }));
 if (AUTO_SYNC_HOURS > 0) {
   setTimeout(autoSync, 60_000);
   setInterval(autoSync, AUTO_SYNC_HOURS * 3_600_000);

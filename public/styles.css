@@ -91,6 +91,17 @@ h3 { font-size: 13px; }
 .brand-sub { font-size: 15px; color: #7f8491; margin-top: 1px; }
 .brand-sub b { color: #ee8f3e; font-weight: 650; }
 
+.portfolio-switch { padding: 12px 14px 4px; }
+.portfolio-switch label { display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: #616674; margin-bottom: 6px; }
+.portfolio-switch .ps-row { display: flex; gap: 6px; }
+.portfolio-switch select { flex: 1; background: rgba(255, 255, 255, 0.04); color: #fff; border-color: rgba(255, 255, 255, 0.12); }
+.portfolio-switch .icon-btn { background: transparent; color: #b4b8c4; border-color: rgba(255, 255, 255, 0.12); }
+.mode-choice { display: grid; gap: 8px; margin-bottom: 14px; }
+.mode-choice label { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 10px; cursor: pointer; }
+.mode-choice label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.mode-choice input { margin-top: 3px; height: auto; }
+.mode-choice b { display: block; color: var(--ink); }
+.mode-choice span { color: var(--muted); font-size: 12px; font-weight: 400; }
 .nav { display: flex; flex-direction: column; padding: 8px 12px; flex: 1; overflow-y: auto; }
 .nav-section { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: #616674; padding: 18px 12px 8px; }
 .nav a {
@@ -267,6 +278,7 @@ dialog::backdrop { background: rgba(5, 7, 12, 0.6); }
 
 /* ---------- small screens: sidebar collapses to a top bar with a menu ---------- */
 @media (max-width: 860px) {
+  .portfolio-switch { order: 2; width: 100%; padding: 0 16px 10px; }
   .sidebar { position: sticky; top: 0; inset: auto; width: auto; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
   .brand { border-bottom: 0; padding: 12px 16px; flex: 1; }
   .logo img { width: 38px; height: 38px; }

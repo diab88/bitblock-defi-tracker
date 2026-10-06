@@ -16,6 +16,15 @@ function metamaskProvider() {
 function phantomEvmProvider() {
   return announced.get('app.phantom')?.provider || (window.phantom?.ethereum?.isPhantom ? window.phantom.ethereum : null);
 }
+// Trust Wallet's browser extension injects an EVM provider (announced over EIP-6963, or as window.trustwallet).
+function trustWalletProvider() {
+  if (announced.has('com.trustwallet.app')) return announced.get('com.trustwallet.app').provider;
+  const t = window.trustwallet?.ethereum || window.trustwallet;
+  if (t?.request) return t;
+  const eth = window.ethereum;
+  const list = eth?.providers?.length ? eth.providers : eth ? [eth] : [];
+  return list.find((p) => p.isTrust || p.isTrustWallet) || null;
+}
 function phantomSolanaProvider() {
   const p = window.phantom?.solana || window.solana;
   return p?.isPhantom ? p : null;
@@ -23,7 +32,7 @@ function phantomSolanaProvider() {
 
 export function walletSupport() {
   window.dispatchEvent(new Event("eip6963:requestProvider"));
-  return { metamask: !!metamaskProvider(), phantomSolana: !!phantomSolanaProvider(), phantomEvm: !!phantomEvmProvider() };
+  return { metamask: !!metamaskProvider(), phantomSolana: !!phantomSolanaProvider(), phantomEvm: !!phantomEvmProvider(), trust: !!trustWalletProvider() };
 }
 
 async function requestEvmAccount(provider, name) {
@@ -34,6 +43,7 @@ async function requestEvmAccount(provider, name) {
 }
 
 export const connectMetaMask = () => requestEvmAccount(metamaskProvider(), 'MetaMask');
+export const connectTrustWallet = () => requestEvmAccount(trustWalletProvider(), 'Trust Wallet');
 export const connectPhantomEvm = () => requestEvmAccount(phantomEvmProvider(), 'Phantom (EVM)');
 
 export async function connectPhantomSolana() {

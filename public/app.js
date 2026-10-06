@@ -1,4 +1,4 @@
-import { walletSupport, connectMetaMask, connectPhantomSolana, connectPhantomEvm, evmNativeBalance } from './wallets.js';
+import { walletSupport, connectMetaMask, connectPhantomSolana, connectPhantomEvm, connectTrustWallet, evmNativeBalance } from './wallets.js';
 
 // ---------- utilities ----------
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -8,8 +8,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const today = () => new Date().toISOString().slice(0, 10);
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
+// Every API call is scoped to the active portfolio; the server falls back to the first one if unknown.
+let currentPortfolio = (() => { try { return Number(localStorage.getItem('portfolio')) || null; } catch { return null; } })();
 async function api(method, url, body) {
-  const res = await fetch(url, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+  const headers = { ...(body ? { 'content-type': 'application/json' } : {}), ...(currentPortfolio ? { 'x-portfolio': String(currentPortfolio) } : {}) };
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const data = res.headers.get('content-type')?.includes('json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
   return data;
@@ -82,7 +85,62 @@ const filters = { wallet: '', currency: '', status: '' };
 let matrixMetric = 'ret';
 let matrixCols = 'venue'; // 'venue' | 'chain'
 let allocBy = 'byChain';
-async function loadMeta() { meta = await api('GET', '/api/meta'); }
+async function loadMeta() {
+  meta = await api('GET', '/api/meta');
+  if (meta.portfolio && meta.portfolio.id !== currentPortfolio) setPortfolioId(meta.portfolio.id);
+  renderPortfolioSwitch();
+}
+function setPortfolioId(id) {
+  currentPortfolio = id;
+  try { localStorage.setItem('portfolio', String(id)); } catch {}
+}
+
+// ---------- portfolios ----------
+function renderPortfolioSwitch() {
+  const sel = $('#portfolioSel');
+  if (!sel || !meta.portfolios) return;
+  sel.innerHTML = meta.portfolios.map((p) => `<option value="${p.id}" ${p.id === currentPortfolio ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+  sel.title = meta.portfolios.map((p) => `${p.name}: ${p.wallets} wallet(s), ${p.positions} position(s)`).join('\n');
+}
+async function switchPortfolio(id) {
+  setPortfolioId(id);
+  filters.wallet = ''; // a wallet filter from another portfolio wouldn't apply
+  Object.keys(snapCache).forEach((k) => delete snapCache[k]);
+  closeDrawer();
+  await loadMeta();
+  toast(`Switched to “${meta.portfolio?.name}”`);
+  showSyncStatus();
+  rerender();
+}
+function openPortfolioManager() {
+  const rows = meta.portfolios.map((p) => `<tr><td><strong>${esc(p.name)}</strong>${p.id === currentPortfolio ? ' <span class="tag accent">active</span>' : ''}<span class="sub">${p.wallets} wallet(s) · ${p.positions} position(s)</span></td>
+    <td class="num"><div class="actions" style="justify-content:flex-end">${p.id === currentPortfolio ? '' : `<button class="btn sm" data-open-pf="${p.id}">Open</button>`}<button class="btn sm" data-rename-pf="${p.id}">Rename</button>
+    <button class="btn sm danger" data-del-pf="${p.id}" ${p.wallets || p.positions || meta.portfolios.length === 1 ? `disabled title="${meta.portfolios.length === 1 ? 'You need at least one portfolio' : 'Only empty portfolios can be deleted'}"` : ''}>Delete</button></div></td></tr>`).join('');
+  openModal(`<div class="modal-body"><h2>Portfolios</h2><p>Each portfolio has its own wallets, positions, totals and syncs. A portfolio can hold any mix of wallets (MetaMask, Phantom, Trust Wallet, watched addresses).</p>
+      <table><tbody>${rows}</tbody></table>
+      <div class="form" style="margin-top:14px"><label class="full">New portfolio<input name="name" placeholder="e.g. Long-term holdings" maxlength="60"></label></div></div>
+    <div class="modal-foot"><button class="btn" data-cancel>Close</button><button class="btn primary" type="submit">Create portfolio</button></div>`,
+  async (f) => {
+    if (!f.name.trim()) throw new Error('Enter a name for the new portfolio');
+    const p = await api('POST', '/api/portfolios', { name: f.name });
+    await switchPortfolio(p.id);
+  });
+  const form = modal.querySelector('form');
+  $$('[data-open-pf]', form).forEach((b) => (b.onclick = guard(async () => { modal.close(); await switchPortfolio(Number(b.dataset.openPf)); })));
+  $$('[data-rename-pf]', form).forEach((b) => (b.onclick = guard(async () => {
+    const p = meta.portfolios.find((x) => x.id === Number(b.dataset.renamePf));
+    const name = prompt('Rename portfolio', p.name);
+    if (!name || name === p.name) return;
+    await api('PUT', `/api/portfolios/${p.id}`, { name });
+    modal.close(); await loadMeta(); toast('Renamed'); rerender();
+  })));
+  $$('[data-del-pf]', form).forEach((b) => (b.onclick = guard(async () => {
+    const p = meta.portfolios.find((x) => x.id === Number(b.dataset.delPf));
+    if (!confirm(`Delete the empty portfolio “${p.name}”?`)) return;
+    await api('DELETE', `/api/portfolios/${p.id}`);
+    modal.close(); await loadMeta(); toast('Portfolio deleted'); rerender();
+  })));
+}
 
 // ---------- router ----------
 const routes = { dashboard: renderDashboard, positions: renderPositions, wallets: renderWallets, prices: renderPrices, guide: renderGuide };
@@ -92,7 +150,7 @@ async function route() {
   $('#sidebar').classList.remove('open');
   $('#menuBtn').setAttribute('aria-expanded', 'false');
   destroyCharts();
-  try { await (routes[name] || renderDashboard)(); } catch (e) { view.innerHTML = `<div class="card empty"><h2>Something went wrong</h2><p>${esc(e.message)}</p></div>`; }
+  try { await loadMeta(); await (routes[name] || renderDashboard)(); } catch (e) { view.innerHTML = `<div class="card empty"><h2>Something went wrong</h2><p>${esc(e.message)}</p></div>`; }
 }
 window.addEventListener('hashchange', route);
 const rerender = () => route();
@@ -300,7 +358,7 @@ async function renderDashboard() {
     ${kpi('Open position value', usd(k.valueOpenUsd), `${usd(k.investedOpenUsd)} deposited`, true)}
     ${kpi('Total profit / loss', `<span class="${signCls(k.pnlUsd)}">${signed(usd(k.pnlUsd), k.pnlUsd)}</span>`, `Open ${usd(k.pnlOpenUsd)} · Closed ${usd(k.pnlClosedUsd)}`)}
     ${kpi('Total return', `<span class="${signCls(k.totalReturn)}">${pct(k.totalReturn)}</span>`, `on ${usd(k.depositedUsd)} total deposits`)}
-    ${kpi('Annualized (simple, weighted)', pct(k.weightedApr), 'Deposit-weighted average of positions')}
+    ${kpi('Annualized (simple, weighted)', pct(k.weightedApr), 'Deposit-weighted, positions held 30+ days')}
     ${kpi('Positions', `${k.open} <span class="muted" style="font-size:15px">open</span> · ${k.closed} <span class="muted" style="font-size:15px">closed</span>`, k.incomplete ? `${k.incomplete} incomplete` : `${k.positions} total`)}
     ${kpi('Withdrawn + rewards', usd(k.withdrawalsUsd + k.rewardsUsd), `${usd(k.withdrawalsUsd)} withdrawn · ${usd(k.rewardsUsd)} rewards`)}
   </section>
@@ -322,7 +380,7 @@ async function renderDashboard() {
   ${exposureCard(hx?.exposure)}
 
   <section class="card" style="margin-bottom:16px">
-    <div class="card-head"><div><h2>Performance matrix</h2><p>Every position: actual vs. expected annual return</p></div></div>
+    <div class="card-head"><div><h2>Performance matrix</h2><p>Every position: actual vs. your own target annual return (set per position; blank = none)</p></div></div>
     <div class="table-wrap">${performanceTable(d.positions)}</div>
   </section>
 
@@ -445,23 +503,34 @@ function returnBar(v, max) {
   return `<div class="rbar"><span class="${signCls(v)}">${pct(v)}</span><span class="track"><span class="mid"></span><span class="fill" style="${style};background:${col}"></span></span></div>`;
 }
 
+// Target = the user's own "target annual return" on the position (never defaulted). vs. target needs both a
+// target and 30+ days of history (MIN_DAYS_FOR_ANNUALIZED on the server).
+const targetValue = (r) => (r.expected_return === null || r.expected_return === undefined ? '<span class="muted" title="No target set. Add one with Edit → Target annual return.">Not set</span>' : pct(r.expected_return));
+function vsTargetCell(m) {
+  const t = m.target || { status: 'none' };
+  if (t.status === 'none') return '<span class="muted" title="No target set for this position">—</span>';
+  if (t.status === 'too-early') return `<span class="muted" title="Compared after 30 days: annualizing ${m.duration ?? 0} day(s) of P/L would exaggerate it">after 30 d</span>`;
+  return `<span class="${signCls(t.gap)}" title="Simple annualized return ${pct(m.annualized)} − your target ${pct(t.target)}">${signed(pct(t.gap), t.gap)}</span>`;
+}
+const annualizedNote = (m) => (m.annualized !== null && !m.annualizedReliable ? `<span class="sub" title="Held under 30 days: annualizing this short a period exaggerates it">under 30 days</span>` : '');
+
 function performanceTable(rows) {
-  const max = Math.max(...rows.map((r) => Math.abs(r.metrics.annualized ?? 0)), 1e-9);
+  // Scale the bars on positions with a meaningful annual figure, so one 2-day outlier doesn't flatten the rest.
+  const max = Math.max(...rows.filter((r) => r.metrics.annualizedReliable).map((r) => Math.abs(r.metrics.annualized ?? 0)), 1e-9);
   const maxT = Math.max(...rows.map((r) => Math.abs(r.metrics.totalReturn ?? 0)), 1e-9);
-  return `<table><thead><tr><th>Position</th><th>Status</th><th class="num">Deposit</th><th class="num">Value</th><th class="num">P/L</th><th class="num">Total return</th><th class="num">Annualized</th><th class="num">Expected</th><th class="num">vs. target</th><th class="num">Days</th></tr></thead><tbody>
+  return `<table><thead><tr><th>Position</th><th>Status</th><th class="num">Deposit</th><th class="num">Value</th><th class="num">P/L</th><th class="num">Total return</th><th class="num">Annualized</th><th class="num" title="Your own target, set on each position (Edit → Target annual return). Never filled in by the app.">Your target</th><th class="num" title="Annualized (simple) − your target, once a position has 30+ days">vs. target</th><th class="num">Days</th></tr></thead><tbody>
   ${rows.map((r) => {
     const m = r.metrics;
-    const gap = m.annualized !== null && r.expected_return !== null ? m.annualized - r.expected_return : null;
     return `<tr class="click ${m.status === 'Closed' ? 'closed' : ''}" data-id="${r.id}">
       <td class="name-col"><strong>${esc(r.protocol || r.strategy || 'Untitled')}</strong>${hedgeTag(r.id)}<span class="sub">${esc([r.strategy, r.chain, r.wallet].filter(Boolean).join(' · '))}</span></td>
       <td>${statusPill(m.status)}</td>
-      <td class="num">${amt(r.deposit)} <span class="muted">${esc(r.currency || '')}</span></td>
+      <td class="num">${amt(m.capital ?? r.deposit)} <span class="muted">${esc(r.currency || '')}</span></td>
       <td class="num">${amt(m.currentValue)}</td>
       <td class="num ${signCls(m.pnl)}">${m.pnl === null ? '—' : signed(amt(m.pnl), m.pnl)}<span class="sub">${m.pnlUsd !== null ? usd(m.pnlUsd) : ''}</span></td>
       <td class="num">${returnBar(m.totalReturn, maxT)}</td>
-      <td class="num">${returnBar(m.annualized, max)}</td>
-      <td class="num">${pct(r.expected_return)}</td>
-      <td class="num ${signCls(gap)}">${gap === null ? '—' : signed(pct(gap), gap)}</td>
+      <td class="num">${returnBar(m.annualized, max)}${annualizedNote(m)}</td>
+      <td class="num">${targetValue(r)}</td>
+      <td class="num">${vsTargetCell(m)}</td>
       <td class="num">${m.duration ?? '—'}</td></tr>`;
   }).join('')}</tbody></table>`;
 }
@@ -482,13 +551,14 @@ async function renderPositions() {
   view.innerHTML = `<div class="page-head"><div><h1>Positions</h1><p>Your journal of DeFi strategies — the spreadsheet's Strategies sheet. Click a row to update it.</p></div>
     <div class="actions"><input id="pSearch" placeholder="Search protocol, chain, wallet…" value="${esc(posSearch)}" style="width:240px"><a class="btn" href="/api/export.csv">Export CSV</a></div></div>
     ${suggestionsCard(sugg)}
-    <div class="card">${rows.length ? `<div class="table-wrap"><table id="pTable"><thead><tr><th>Wallet</th><th>Strategy</th><th>Protocol</th><th>Chain</th><th>Entry</th><th>Valued</th><th class="num">Deposit</th><th class="num">Current value</th><th class="num">Withdrawn</th><th class="num">Rewards</th><th class="num">Fees</th><th class="num">P/L</th><th class="num">Return</th><th class="num">Annualized</th><th>Status</th></tr></thead><tbody>
+    <div class="card">${rows.length ? `<div class="table-wrap"><table id="pTable"><thead><tr><th>Wallet</th><th>Strategy</th><th>Protocol</th><th>Chain</th><th>Entry</th><th>Valued</th><th class="num">Deposit</th><th class="num">Current value</th><th class="num">Withdrawn</th><th class="num">Rewards</th><th class="num">Fees</th><th class="num">P/L</th><th class="num">Return</th><th class="num">Annualized</th><th class="num" title="Your own target, set on each position (Edit → Target annual return)">Your target</th><th class="num" title="Annualized − your target, once a position has 30+ days">vs. target</th><th>Status</th></tr></thead><tbody>
     ${rows.map((r) => { const m = r.metrics; return `<tr class="click ${m.status === 'Closed' ? 'closed' : ''}" data-id="${r.id}" data-q="${esc([r.wallet, r.strategy, r.protocol, r.chain, r.currency, r.comments].join(' ').toLowerCase())}">
       <td>${esc(r.wallet || '—')}</td><td>${esc(r.strategy || '—')}</td><td><strong>${esc(r.protocol || '—')}</strong>${hedgeTag(r.id)}${r.debank_key ? ` <span class="tag accent" title="Auto-valued from ${sourceOf(r.debank_key)}">${sourceOf(r.debank_key)}</span>` : ''}${breakdownInline(r.sourceDetail)}</td><td>${esc(r.chain || '—')}</td>
       <td class="num">${esc(r.entry_date || '—')}</td><td class="num">${esc(r.closed ? r.exit_date : m.valuationDate || '—')}</td>
       <td class="num">${amt(m.capital ?? r.deposit)} <span class="muted">${esc(r.currency || '')}</span>${m.added ? `<span class="sub">incl. ${amt(m.added)} added</span>` : ''}</td><td class="num">${amt(m.currentValue)}</td>
       <td class="num">${m.withdrawals ? amt(m.withdrawals) : '—'}</td><td class="num">${m.rewards ? amt(m.rewards) : '—'}</td><td class="num">${m.fees ? amt(m.fees) : '—'}</td>
-      <td class="num ${signCls(m.pnl)}">${m.pnl === null ? '—' : signed(amt(m.pnl), m.pnl)}</td><td class="num ${signCls(m.totalReturn)}">${pct(m.totalReturn)}</td><td class="num ${signCls(m.annualized)}">${pct(m.annualized)}</td>
+      <td class="num ${signCls(m.pnl)}">${m.pnl === null ? '—' : signed(amt(m.pnl), m.pnl)}</td><td class="num ${signCls(m.totalReturn)}">${pct(m.totalReturn)}</td><td class="num ${signCls(m.annualized)}">${pct(m.annualized)}${annualizedNote(m)}</td>
+      <td class="num">${targetValue(r)}</td><td class="num">${vsTargetCell(m)}</td>
       <td>${statusPill(m.status)}</td></tr>`; }).join('')}
     </tbody></table></div>` : `<div class="empty"><h2>No positions yet</h2><p>Start with “+ New position”, or import from a connected wallet.</p></div>`}</div>`;
   $$('#pTable tbody tr').forEach((tr) => (tr.onclick = () => openDrawer(Number(tr.dataset.id))));
@@ -528,7 +598,7 @@ function openPositionForm(p = null, prefill = {}) {
       <label>Protocol / platform<input name="protocol" list="dlProtocols" value="${esc(v.protocol)}" placeholder="e.g. Aave V3"></label>
       <label>Chain *<input name="chain" list="dlChains" value="${esc(v.chain)}" required placeholder="e.g. Arbitrum"></label>
       <label>Currency *<input name="currency" list="dlCurrencies" value="${esc(v.currency)}" required placeholder="e.g. USDC"></label>
-      <label>Expected annual return <span class="hint">%, e.g. 8 (note APR/APY in comments)</span><input name="expected_return" type="number" step="any" value="${v.expected_return != null ? +(v.expected_return * 100).toFixed(6) : ''}"></label>
+      <label>Target annual return (optional) <span class="hint">your own goal, as a simple APR in %, e.g. 8. Leave blank for no target. The app never sets one for you.</span><input name="expected_return" type="number" step="any" value="${v.expected_return != null ? +(v.expected_return * 100).toFixed(6) : ''}"></label>
       <label>Entry date *<input name="entry_date" type="date" value="${esc(v.entry_date || today())}" required></label>
       <label>Deposit *<input name="deposit" type="number" step="any" min="0" value="${v.deposit ?? ''}" required></label>
       ${edit ? '' : `<label>Current value <span class="hint">what the platform shows now</span><input name="current_value" type="number" step="any" min="0" value="${v.current_value ?? ''}" placeholder="defaults to deposit"></label>
@@ -550,10 +620,74 @@ function openPositionForm(p = null, prefill = {}) {
 const EVENT_LABELS = {
   valuation: ['Update value', 'Enter the actual remaining value the platform shows now. Withdrawals recorded before this date are treated as already reflected in it.'],
   withdrawal: ['Record withdrawal', 'Money taken out of the position. Deposit and profit stay unchanged; current value goes down.'],
-  reward: ['Record reward', 'Rewards received separately — only if not already in the position value or a withdrawal. Convert other tokens to this position’s currency first.'],
+  reward: ['Add a reward payment', 'Rewards received separately — only if not already in the position value or a withdrawal. Convert other tokens to this position’s currency first.'],
   deposit: ['Add capital', 'Money or tokens added to this position after it started (a top-up). Raises the amount invested, not the profit.'],
   fee: ['Record fee', 'Costs not already deducted from the position value, withdrawals or rewards (e.g. gas, bridge fees).'],
 };
+// Rewards: either the platform's total-to-date (replaces the total) or one payment (adds to it).
+function openRewardForm(p) {
+  const cur = esc(p.currency || '');
+  const now = p.metrics.rewards || 0;
+  openModal(`<div class="modal-body"><h2>Rewards</h2><p>Rewards to date on this position: <strong>${amt(now)} ${cur}</strong>. Fees are recorded separately with <em>Fee</em>.</p>
+    <div class="mode-choice">
+      <label><input type="radio" name="mode" value="total" checked><div><b>Update total rewards to date</b><span>Enter the total the platform shows now. It <u>replaces</u> the current total: ${amt(now)} → your number.</span></div></label>
+      <label><input type="radio" name="mode" value="payment"><div><b>Add one reward payment</b><span>A single payment you received. It is <u>added</u> to the current total.</span></div></label>
+    </div>
+    <div class="form">
+      <label>Date<input name="date" type="date" value="${today()}" required></label>
+      <label><span data-amount-label>Total rewards to date (${cur})</span><input name="amount" type="number" step="any" min="0" required autofocus></label>
+      <label class="full">Note<input name="note" placeholder="optional, e.g. claimed on the platform"></label>
+      <p class="full muted" data-preview style="margin:0;font-size:12px"></p></div></div>
+    <div class="modal-foot"><button class="btn" data-cancel>Cancel</button><button class="btn primary" type="submit">Save</button></div>`,
+  async (f) => {
+    const type = f.mode === 'total' ? 'reward_total' : 'reward';
+    await api('POST', `/api/positions/${p.id}/events`, { type, date: f.date, amount: f.amount, note: f.note });
+    toast(type === 'reward_total' ? `Rewards to date set to ${amt(Number(f.amount))} ${p.currency || ''}` : 'Reward payment added');
+    openDrawer(p.id); rerender();
+  });
+  const form = modal.querySelector('form');
+  const preview = () => {
+    const mode = form.mode.value, v = Number(form.amount.value);
+    $('[data-amount-label]', form).textContent = mode === 'total' ? `Total rewards to date (${p.currency || ''})` : `Payment amount (${p.currency || ''})`;
+    $('[data-preview]', form).textContent = form.amount.value === '' ? '' : `After saving, rewards to date will be ${amt(mode === 'total' ? v : now + v)} ${p.currency || ''}.${mode === 'total' && v < now ? ' (Lower than now: that is fine if you are correcting the total.)' : ''}`;
+  };
+  form.addEventListener('input', preview); form.addEventListener('change', preview);
+}
+
+// Correct an entry in place. The server keeps the previous values, so it can be undone.
+const EVENT_NAMES = { valuation: 'value update', withdrawal: 'withdrawal', reward: 'reward payment', reward_total: 'rewards to date', fee: 'fee', deposit: 'capital in' };
+function openEditEventForm(p, e) {
+  const cur = esc(p.currency || '');
+  const rewardFamily = e.type === 'reward' || e.type === 'reward_total';
+  openModal(`<div class="modal-body"><h2>Correct this entry (${EVENT_NAMES[e.type] || e.type})</h2>
+    <p>Currently <strong>${amt(e.amount)} ${cur}</strong> on ${esc(e.date)}. Your change replaces it everywhere (P/L, returns, charts), and the old value is kept in the correction history so you can undo it.</p>
+    <div class="form">
+      ${rewardFamily ? `<label class="full">Recorded as<select name="type">
+        <option value="reward_total" ${e.type === 'reward_total' ? 'selected' : ''}>Total rewards to date (replaces the total)</option>
+        <option value="reward" ${e.type === 'reward' ? 'selected' : ''}>One reward payment (adds to the total)</option></select></label>` : ''}
+      <label>Date<input name="date" type="date" value="${esc(e.date)}" required></label>
+      <label>Amount (${cur})<input name="amount" type="number" step="any" min="0" value="${e.amount}" required autofocus></label>
+      <label class="full">Note<input name="note" value="${esc(e.note || '')}"></label>
+      <label class="full">Reason for the correction <span class="hint">optional, e.g. “typo: 977 → 77”</span><input name="reason"></label></div></div>
+    <div class="modal-foot"><button class="btn" data-cancel>Cancel</button><button class="btn primary" type="submit">Save correction</button></div>`,
+  async (f) => {
+    const r = await api('PUT', `/api/events/${e.id}`, { ...(f.type ? { type: f.type } : {}), date: f.date, amount: f.amount, note: f.note, reason: f.reason });
+    toast(r.changed ? 'Corrected. Previous value kept in history' : 'Nothing changed');
+    openDrawer(p.id); rerender();
+  });
+}
+
+function revisionsCard(p, revs) {
+  if (!revs?.length) return '';
+  const cur = esc(p.currency || '');
+  const show = (x) => (x ? `${esc(EVENT_NAMES[x.type] || x.type)} ${amt(x.amount)} ${cur} · ${esc(x.date)}` : '—');
+  return `<div class="card" style="margin-top:14px"><div class="card-head"><div><h2>Correction history</h2><p>Every edit, deletion and restore, newest first. Restore puts an entry back the way it was before that change.</p></div></div>
+    <table><tbody>${revs.map((r) => `<tr><td class="num" style="text-align:left;white-space:nowrap">${esc(r.changed_at.slice(0, 16))}</td>
+      <td><span class="tag ${r.action === 'delete' ? '' : 'accent'}">${r.action === 'update' ? 'corrected' : r.action === 'delete' ? 'deleted' : 'restored'}</span>
+      <span class="sub">${r.action === 'restore' ? `back to ${show(r.after)}` : `${show(r.before)} → ${r.action === 'delete' ? 'removed' : show(r.after)}`}${r.reason ? ` · “${esc(r.reason)}”` : ''}</span></td>
+      <td class="num">${r.before && r.action !== 'restore' ? `<button class="btn sm" data-restore="${r.id}">Restore</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
 function openEventForm(p, type) {
   const [title, hint] = EVENT_LABELS[type];
   openModal(`<div class="modal-body"><h2>${title}</h2><p>${hint}</p><div class="form">
@@ -583,7 +717,7 @@ drawer.addEventListener('click', (e) => { if (e.target === drawer) closeDrawer()
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modal.open) closeDrawer(); });
 
 async function openDrawer(id) {
-  const [rows, series, sugg] = await Promise.all([api('GET', '/api/positions'), api('GET', `/api/positions/${id}/series`), api('GET', `/api/suggestions?position=${id}`).catch(() => [])]);
+  const [rows, series, sugg, revs] = await Promise.all([api('GET', '/api/positions'), api('GET', `/api/positions/${id}/series`), api('GET', `/api/suggestions?position=${id}`).catch(() => []), api('GET', `/api/positions/${id}/revisions`).catch(() => [])]);
   const p = rows.find((r) => r.id === id);
   if (!p) return closeDrawer();
   const m = p.metrics;
@@ -593,17 +727,17 @@ async function openDrawer(id) {
       <h1 id="drawerTitle">${esc(p.protocol || p.strategy || 'Position')}</h1><div style="margin-top:6px;display:flex;gap:6px;align-items:center">${statusPill(m.status)} <span class="tag">${esc(p.strategy || '')}</span>${p.debank_key ? `<span class="tag accent">${sourceOf(p.debank_key)}-linked</span>` : ''}${hedgeTag(p.id)}</div></div>
       <button class="icon-btn" id="dClose" aria-label="Close">✕</button></div>
     <div class="actions" style="margin-bottom:14px">
-      ${p.closed ? '<button class="btn sm" data-act="reopen">Reopen</button>' : `<button class="btn sm primary" data-act="valuation">Update value</button><button class="btn sm" data-act="withdrawal">Withdrawal</button><button class="btn sm" data-act="reward">Reward</button><button class="btn sm" data-act="fee">Fee</button><button class="btn sm" data-act="deposit">Add capital</button><button class="btn sm" data-act="close">Close position</button>`}
+      ${p.closed ? '<button class="btn sm" data-act="reopen">Reopen</button>' : `<button class="btn sm primary" data-act="valuation">Update value</button><button class="btn sm" data-act="withdrawal">Withdrawal</button><button class="btn sm" data-act="rewards" title="Update total rewards to date, or add one payment">Rewards</button><button class="btn sm" data-act="fee">Fee</button><button class="btn sm" data-act="deposit">Add capital</button><button class="btn sm" data-act="close">Close position</button>`}
       <button class="btn sm" data-act="edit">Edit</button><button class="btn sm danger" data-act="delete">Delete</button></div>
     <div class="metric-grid" style="margin-bottom:14px">
       <div><div class="label">Deposit${m.added ? ' (incl. capital added)' : ''}</div><div class="v">${amt(m.capital ?? p.deposit)} ${cur}</div></div>
       <div><div class="label">${p.closed ? 'Exit value' : 'Current value'}</div><div class="v">${amt(m.currentValue)} ${cur}</div></div>
       <div><div class="label">Profit / loss</div><div class="v ${signCls(m.pnl)}">${m.pnl === null ? '—' : signed(amt(m.pnl), m.pnl)} ${cur}</div></div>
       <div><div class="label">Total return</div><div class="v ${signCls(m.totalReturn)}">${pct(m.totalReturn)}</div></div>
-      <div><div class="label">Annualized (simple)</div><div class="v ${signCls(m.annualized)}">${pct(m.annualized)}</div></div>
-      <div><div class="label">Expected</div><div class="v">${pct(p.expected_return)}</div></div>
+      <div><div class="label">Annualized (simple)</div><div class="v ${signCls(m.annualized)}">${pct(m.annualized)}${annualizedNote(m)}</div></div>
+      <div><div class="label" title="Your own target on this position (Edit → Target annual return)">Your target → vs. target</div><div class="v" style="font-size:14px">${targetValue(p)} → ${vsTargetCell(m)}</div></div>
       <div><div class="label">Withdrawn</div><div class="v">${amt(m.withdrawals)}</div></div>
-      <div><div class="label">Rewards − fees</div><div class="v">${amt(m.rewards - m.fees)}</div></div>
+      <div><div class="label">Rewards to date · fees</div><div class="v" style="font-size:14px">${amt(m.rewards)} · −${amt(m.fees)}</div></div>
       <div><div class="label">Duration</div><div class="v">${m.duration ?? '—'} days</div></div>
       <div><div class="label">P/L in USD</div><div class="v ${signCls(m.pnlUsd)}">${usd(m.pnlUsd)}</div></div>
       <div><div class="label">USD price</div><div class="v">${m.usdPrice ? usd(m.usdPrice) : '—'}</div></div>
@@ -614,18 +748,28 @@ async function openDrawer(id) {
     <div class="card" style="margin-bottom:14px"><div class="card-head"><h2>Value history (${cur})</h2></div><div class="chart-box sm"><canvas id="dChart"></canvas></div></div>
     ${p.comments ? `<div class="card" style="margin-bottom:14px"><h3>Comments</h3><p class="ink2" style="margin:6px 0 0;white-space:pre-wrap">${esc(p.comments)}</p></div>` : ''}
     <div class="card"><div class="card-head"><h2>Activity</h2></div>
-      ${evs.length ? `<table><tbody>${evs.map((e) => `<tr><td class="num" style="text-align:left">${esc(e.date)}</td><td><span class="tag">${esc(e.type === 'deposit' ? 'capital in' : e.type)}</span>${SOURCES[e.source] ? ` <span class="tag">${SOURCES[e.source].label}</span>` : ''}<span class="sub">${esc(e.note || '')}</span></td><td class="num">${e.type === 'withdrawal' || e.type === 'fee' ? '−' : e.type === 'deposit' ? '+' : ''}${amt(e.amount)} ${cur}</td><td style="width:1%"><button class="btn sm danger" data-del="${e.id}" aria-label="Delete entry">✕</button></td></tr>`).join('')}</tbody></table>` : '<p class="muted">No activity yet.</p>'}</div>`;
+      ${evs.length ? `<table><tbody>${evs.map((e) => `<tr><td class="num" style="text-align:left">${esc(e.date)}</td><td><span class="tag">${esc(EVENT_NAMES[e.type] || e.type)}</span>${SOURCES[e.source] ? ` <span class="tag">${SOURCES[e.source].label}</span>` : ''}${e.corrected ? ' <span class="tag accent" title="This entry was corrected; see Correction history">corrected</span>' : ''}<span class="sub">${esc(e.note || '')}</span></td><td class="num">${e.type === 'withdrawal' || e.type === 'fee' ? '−' : e.type === 'deposit' ? '+' : e.type === 'reward_total' ? '= ' : ''}${amt(e.amount)} ${cur}</td><td style="width:1%;white-space:nowrap"><button class="btn sm" data-edit="${e.id}" aria-label="Correct entry" title="Correct this entry">✎</button> <button class="btn sm danger" data-del="${e.id}" aria-label="Delete entry">✕</button></td></tr>`).join('')}</tbody></table>` : '<p class="muted">No activity yet.</p>'}</div>
+    ${revisionsCard(p, revs)}`;
 
   $('#dClose').onclick = closeDrawer;
   $$('[data-act]', panel).forEach((b) => (b.onclick = guard(async () => {
     const a = b.dataset.act;
+    if (a === 'rewards') return openRewardForm(p);
     if (EVENT_LABELS[a]) return openEventForm(p, a);
     if (a === 'close') return openCloseForm(p);
     if (a === 'edit') return openPositionForm(p);
     if (a === 'reopen') { await api('POST', `/api/positions/${p.id}/reopen`); toast('Reopened'); openDrawer(p.id); return rerender(); }
     if (a === 'delete') return confirmModal('Delete position?', 'This removes the position and all of its activity. This cannot be undone.', 'Delete', async () => { await api('DELETE', `/api/positions/${p.id}`); closeDrawer(); toast('Deleted'); rerender(); });
   })));
-  $$('[data-del]', panel).forEach((b) => (b.onclick = guard(async () => { await api('DELETE', `/api/events/${b.dataset.del}`); openDrawer(p.id); rerender(); })));
+  $$('[data-edit]', panel).forEach((b) => (b.onclick = () => openEditEventForm(p, p.events.find((e) => e.id === Number(b.dataset.edit)))));
+  $$('[data-del]', panel).forEach((b) => (b.onclick = () => {
+    const e = p.events.find((x) => x.id === Number(b.dataset.del));
+    openModal(`<div class="modal-body"><h2>Delete this ${esc(EVENT_NAMES[e.type] || e.type)}?</h2><p>${amt(e.amount)} ${esc(p.currency || '')} on ${esc(e.date)}. It's kept in the correction history, so you can restore it. To fix a wrong amount, use ✎ instead.</p>
+      <div class="form"><label class="full">Reason <span class="hint">optional</span><input name="reason"></label></div></div>
+      <div class="modal-foot"><button class="btn" data-cancel>Cancel</button><button class="btn primary" type="submit">Delete entry</button></div>`,
+    async (f) => { await api('DELETE', `/api/events/${e.id}?reason=${encodeURIComponent(f.reason || '')}`); toast('Deleted. Restorable from Correction history'); openDrawer(p.id); rerender(); });
+  }));
+  $$('[data-restore]', panel).forEach((b) => (b.onclick = guard(async () => { await api('POST', `/api/revisions/${b.dataset.restore}/restore`); toast('Restored'); openDrawer(p.id); rerender(); })));
   bindSuggestions(sugg, () => { openDrawer(p.id); rerender(); });
 
   drawer.classList.add('open');
@@ -674,7 +818,7 @@ async function renderWallets() {
   const wallets = await api('GET', '/api/wallets');
   const sup = walletSupport();
 
-  view.innerHTML = `<div class="page-head"><div><div class="eyebrow">Portfolio</div><h1>Wallets</h1><p>Connect a browser wallet or paste an address. Read-only: the app only asks for your public address — never a signature or transaction.</p></div></div>
+  view.innerHTML = `<div class="page-head"><div><div class="eyebrow">Portfolio</div><h1>Wallets in “${esc(meta.portfolio?.name || '')}”</h1><p>Wallets belong to the active portfolio; a portfolio can mix MetaMask, Phantom, Trust Wallet and watched addresses. Connect a browser wallet or paste an address. Read-only: the app only asks for your public address — never a signature or transaction.</p></div></div>
   ${sourcesBanner()}
   <section class="grid connect-grid">
     <div class="card connect"><div class="ico" style="background:#f6851b">M</div><h2>MetaMask</h2><p>Connect your EVM address (Ethereum, Arbitrum, Base…). Syncs with DeBank or Zerion.</p>
@@ -682,16 +826,19 @@ async function renderWallets() {
     <div class="card connect"><div class="ico" style="background:#ab9ff2">P</div><h2>Phantom</h2><p>Connect your Solana address (balances via Zerion), or Phantom’s EVM address.</p>
       <div class="actions"><button class="btn primary" id="cPhantom" ${sup.phantomSolana ? '' : 'disabled'}>${sup.phantomSolana ? 'Connect Solana' : 'Phantom not detected'}</button>
       ${sup.phantomEvm ? '<button class="btn" id="cPhantomEvm">Connect EVM</button>' : ''}</div></div>
+    <div class="card connect"><div class="ico" style="background:#3375bb">T</div><h2>Trust Wallet</h2><p>Connect the Trust Wallet browser extension’s EVM address. Syncs with Zerion or DeBank.</p>
+      <button class="btn primary" id="cTrust" ${sup.trust ? '' : 'disabled'}>${sup.trust ? 'Connect Trust Wallet' : 'Trust Wallet not detected'}</button></div>
     <div class="card connect"><div class="ico" style="background:var(--accent)">#</div><h2>Watch an address</h2><p>Paste any EVM (0x…) or Solana address — no extension needed. Or add a named wallet without an address.</p>
       <button class="btn" id="cAddress">Add address</button></div>
   </section>
-  ${!sup.metamask && !sup.phantomSolana ? '<p class="muted" style="margin:-8px 0 20px">No wallet extension found in this browser. Open this page in Chrome/Brave/Firefox with MetaMask or Phantom installed — extensions work on <code>http://localhost</code>.</p>' : ''}
+  ${!sup.metamask && !sup.phantomSolana && !sup.trust ? '<p class="muted" style="margin:-8px 0 20px">No wallet extension found in this browser. Open this page in Chrome/Brave/Firefox with MetaMask or Phantom installed — extensions work on <code>http://localhost</code>.</p>' : ''}
   <section class="stack">${wallets.length ? wallets.map(walletCard).join('') : '<div class="card empty"><h2>No wallets yet</h2><p>Connect or add one above. Positions can then be assigned to it.</p></div>'}</section>`;
 
   const connected = (name, address, source) => openWalletForm({ name, address, source, title: 'Wallet connected', lockAddress: true }, rerender);
   $('#cMetaMask').onclick = guard(async () => { const a = await connectMetaMask(); connected(`MetaMask ${short(a)}`, a, 'metamask'); });
   $('#cPhantom').onclick = guard(async () => { const a = await connectPhantomSolana(); connected(`Phantom SOL ${short(a)}`, a, 'phantom'); });
   $('#cPhantomEvm') && ($('#cPhantomEvm').onclick = guard(async () => { const a = await connectPhantomEvm(); connected(`Phantom EVM ${short(a)}`, a, 'phantom'); }));
+  $('#cTrust').onclick = guard(async () => { const a = await connectTrustWallet(); connected(`Trust Wallet ${short(a)}`, a, 'trustwallet'); });
   $('#cAddress').onclick = () => openWalletForm({}, rerender);
 
   for (const w of wallets) bindWalletCard(w);
@@ -745,7 +892,7 @@ function syncButtons(w) {
 function walletCard(w) {
   const last = w.lastSync ? ` · Last sync: ${SOURCES[w.lastSync.provider]?.label || 'DeBank'}, ${esc(w.lastSync.fetched_at)} UTC · ${usd(w.lastSync.total_usd)} total` : '';
   return `<div class="card wallet-card" id="w${w.id}">
-    <div class="card-head"><div><h2>${esc(w.name)} <span class="tag">${w.kind === 'evm' ? 'EVM' : w.kind === 'solana' ? 'Solana' : 'Manual'}</span>${w.source === 'metamask' || w.source === 'phantom' ? ` <span class="tag">${esc(w.source)}</span>` : ''}</h2>
+    <div class="card-head"><div><h2>${esc(w.name)} <span class="tag">${w.kind === 'evm' ? 'EVM' : w.kind === 'solana' ? 'Solana' : 'Manual'}</span>${({ metamask: 'MetaMask', phantom: 'Phantom', trustwallet: 'Trust Wallet' })[w.source] ? ` <span class="tag">${({ metamask: 'MetaMask', phantom: 'Phantom', trustwallet: 'Trust Wallet' })[w.source]}</span>` : ''}</h2>
       <div class="addr">${esc(w.address || 'No address')}</div>
       <p>${w.positions} position(s)${last}</p>
       <p><span class="tag ${w.track_from ? 'accent' : ''}" title="Profit before this date isn’t counted for this wallet">${esc(trackFromLabel(w.track_from))}</span></p></div>
@@ -892,6 +1039,12 @@ function renderGuide() {
     <li><strong>Collected fees</strong> leave the pool and land in your wallet. They count as rewards: profit = value + withdrawals + rewards − fees − deposit.</li>
     <li>With Zerion connected, each sync scans your transactions and suggests collected fees and deposits for your tracked pools. Confirm them on the Dashboard, the Positions page, or inside a position. Anything it can’t match confidently (e.g. a token that’s in several pools) is skipped; add those with <em>Reward</em> yourself.</li>
   </ul>
+  <h2>Portfolios</h2>
+  <p>Use the <em>Portfolio</em> switcher in the sidebar to create, name and switch portfolios. Each has its own wallets, positions, totals and suggestions, and <em>Sync all</em> only syncs the active one. A portfolio can mix wallet types (MetaMask, Phantom, Trust Wallet, watched addresses). Market prices are shared by all portfolios.</p>
+  <h2>Rewards and corrections</h2>
+  <p><em>Rewards</em> offers two clearly labelled choices: <strong>Update total rewards to date</strong> (replaces the total: 112 → 120 shows 120) or <strong>Add one reward payment</strong> (adds to it). Fees stay separate. To fix a wrong entry (e.g. 977 instead of 77), use ✎ in Activity. The correction applies everywhere, and the old value is kept in <em>Correction history</em> with a Restore button.</p>
+  <h2>Your target</h2>
+  <p>“Your target” is the optional <em>Target annual return</em> you enter on a position (a simple APR). The app never fills it in. “vs. target” is the simple annualized return minus your target, shown once a position has 30+ days. Annualizing a few days of P/L would exaggerate it.</p>
   <h2>Closing a position and moving money to the wallet</h2>
   <p>Money moving between your positions is never profit. When a synced pool disappears and your transactions show its tokens coming back, the app closes the pool at the amount you withdrew; without that evidence it asks you on the Dashboard (“Position closed?”). A wallet’s profit is only the price change of tokens it already held. Tokens arriving or leaving (a closed pool paying out, a transfer from an exchange, gas) are recorded as <em>capital in</em> / <em>withdrawal</em>, so the same dollars are never counted twice.</p>
   <h2>Start tracking from</h2>
@@ -935,7 +1088,7 @@ $('#syncAllBtn').onclick = guard(async () => {
     const failed = r.results.filter((x) => !x.ok);
     const updated = ok.reduce((a, x) => a + x.updated, 0);
     const suggested = ok.reduce((a, x) => a + x.suggested, 0);
-    toast(`Synced ${ok.map((x) => x.source).join(', ') || 'nothing'} · ${updated} position(s) updated${suggested ? ` · ${suggested} new suggestion(s)` : ''}${r.prices ? ' · prices refreshed' : ''}`);
+    toast(`${meta.portfolio?.name || ''}: synced ${ok.map((x) => x.source).join(', ') || 'nothing'} · ${updated} position(s) updated${suggested ? ` · ${suggested} new suggestion(s)` : ''}${r.prices ? ' · prices refreshed' : ''}`);
     ok.flatMap((x) => x.closedList || []).forEach((c) => toast(c.automatic ? `Closed ${c.name} at ${usd(c.exitUsd)} (withdrawn to wallet on ${c.date})` : `${c.name} is no longer reported — confirm on the Dashboard`));
     failed.forEach((x) => toast(`${x.source} (${x.wallet}): ${x.error}`, true));
     rerender();
@@ -946,6 +1099,8 @@ $('#syncAllBtn').onclick = guard(async () => {
 });
 showSyncStatus();
 setInterval(showSyncStatus, 60000);
+$('#portfolioSel').onchange = guard(async (e) => switchPortfolio(Number(e.target.value)));
+$('#portfolioManage').onclick = guard(async () => { await loadMeta(); openPortfolioManager(); });
 // Dark navy is the brand default; light is opt-in.
 const isLight = () => document.documentElement.dataset.theme === 'light';
 const syncThemeLabel = () => { $('#themeToggle span').textContent = isLight() ? 'Dark mode' : 'Light mode'; };
