@@ -37,7 +37,9 @@ app.use('/api', (req, _res, next) => {
   next();
 });
 
-app.use(express.static(path.join(root, 'public')));
+// The page's own files must be re-checked on every load: a cached app.js from before an update would talk to
+// the new server with old expectations. ("no-cache" = revalidate via ETag, so unchanged files cost a 304.)
+app.use(express.static(path.join(root, 'public'), { setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache') }));
 app.use('/vendor/chart.js', express.static(path.join(root, 'node_modules/chart.js/dist')));
 
 // ---------- helpers ----------
