@@ -85,7 +85,7 @@ h3 { font-size: 13px; }
   border-right: 1px solid rgba(255, 255, 255, 0.06); color: #fff;
 }
 .brand { display: flex; align-items: center; gap: 12px; padding: 20px 18px 18px; text-decoration: none; color: #fff; border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
-.logo img { display: block; width: 44px; height: 44px; filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.35)); }
+.logo img { display: block; width: 44px; height: 44px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35); }
 .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
 .brand-name { font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 7px; }
 .brand-sub { font-size: 15px; color: #7f8491; margin-top: 1px; }
